@@ -10,9 +10,10 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from backend import config
+from backend.config import config
 from backend.inpaint.sttn.auto_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
+from backend.tools.inpaint_tools import get_inpaint_area_by_mask
 
 # 定义图像预处理方式
 _to_tensors = transforms.Compose([
@@ -20,21 +21,20 @@ _to_tensors = transforms.Compose([
     ToTorchFormatTensor()  # 将堆叠的图像转化为PyTorch张量
 ])
 
-
 class STTNInpaint:
-    def __init__(self):
-        self.device = config.device
+    def __init__(self, device, model_path):
+        self.device = device
         # 1. 创建InpaintGenerator模型实例并装载到选择的设备上
         self.model = InpaintGenerator().to(self.device)
         # 2. 载入预训练模型的权重，转载模型的状态字典
-        self.model.load_state_dict(torch.load(config.STTN_MODEL_PATH, map_location='cpu')['netG'])
+        self.model.load_state_dict(torch.load(model_path, map_location='cpu')['netG'])
         # 3. # 将模型设置为评估模式
         self.model.eval()
         # 模型输入用的宽和高
         self.model_input_width, self.model_input_height = 640, 120
         # 2. 设置相连帧数
-        self.neighbor_stride = config.STTN_NEIGHBOR_STRIDE
-        self.ref_length = config.STTN_REFERENCE_LENGTH
+        self.neighbor_stride = config.sttnNeighborStride.value
+        self.ref_length = config.sttnReferenceLength.value
 
     def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
         """
@@ -48,7 +48,7 @@ class STTNInpaint:
         W_ori = int(W_ori + 0.5)
         # 确定去字幕的垂直高度部分
         split_h = int(W_ori * 3 / 16)
-        inpaint_area = self.get_inpaint_area_by_mask(H_ori, split_h, mask)
+        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask)
         # 初始化帧存储变量
         # 高分辨率帧存储列表
         frames_hr = copy.deepcopy(input_frames)
@@ -87,7 +87,7 @@ class STTNInpaint:
                     frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = mask_area * comp + (1 - mask_area) * frame[inpaint_area[k][0]:inpaint_area[k][1], :, :]
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
-                print(f'processing frame, {len(frames_hr) - j} left')
+                # print(f'processing frame, {len(frames_hr) - j} left')
         return inpainted_frames
 
     @staticmethod
@@ -163,64 +163,8 @@ class STTNInpaint:
         # 返回处理完成的帧序列
         return comp_frames
 
-    @staticmethod
-    def get_inpaint_area_by_mask(H, h, mask):
-        """
-        获取字幕去除区域，根据mask来确定需要填补的区域和高度
-        """
-        # 存储绘画区域的列表
-        inpaint_area = []
-        # 从视频底部的字幕位置开始，假设字幕通常位于底部
-        to_H = from_H = H
-        # 从底部向上遍历遮罩
-        while from_H != 0:
-            if to_H - h < 0:
-                # 如果下一段会超出顶端，则从顶端开始
-                from_H = 0
-                to_H = h
-            else:
-                # 确定段的上边界
-                from_H = to_H - h
-            # 检查当前段落是否包含遮罩像素
-            if not np.all(mask[from_H:to_H, :] == 0) and np.sum(mask[from_H:to_H, :]) > 10:
-                # 如果不是第一个段落，向下移动以确保没遗漏遮罩区域
-                if to_H != H:
-                    move = 0
-                    while to_H + move < H and not np.all(mask[to_H + move, :] == 0):
-                        move += 1
-                    # 确保没有越过底部
-                    if to_H + move < H and move < h:
-                        to_H += move
-                        from_H += move
-                # 将该段落添加到列表中
-                if (from_H, to_H) not in inpaint_area:
-                    inpaint_area.append((from_H, to_H))
-                else:
-                    break
-            # 移动到下一个段落
-            to_H -= h
-        return inpaint_area  # 返回绘画区域列表
 
-    @staticmethod
-    def get_inpaint_area_by_selection(input_sub_area, mask):
-        print('use selection area for inpainting')
-        height, width = mask.shape[:2]
-        ymin, ymax, _, _ = input_sub_area
-        interval_size = 135
-        # 存储结果的列表
-        inpaint_area = []
-        # 计算并存储标准区间
-        for i in range(ymin, ymax, interval_size):
-            inpaint_area.append((i, i + interval_size))
-        # 检查最后一个区间是否达到了最大值
-        if inpaint_area[-1][1] != ymax:
-            # 如果没有，则创建一个新的区间，开始于最后一个区间的结束，结束于扩大后的值
-            if inpaint_area[-1][1] + interval_size <= height:
-                inpaint_area.append((inpaint_area[-1][1], inpaint_area[-1][1] + interval_size))
-        return inpaint_area  # 返回绘画区域列表
-
-
-class STTNVideoInpaint:
+class STTNAutoInpaint:
 
     def read_frame_info_from_video(self):
         # 使用opencv读取视频
@@ -235,9 +179,9 @@ class STTNVideoInpaint:
         # 返回视频读取对象、帧信息和视频写入对象
         return reader, frame_info
 
-    def __init__(self, video_path, mask_path=None, clip_gap=None):
+    def __init__(self, device, model_path, video_path, mask_path=None, clip_gap=None):
         # STTNInpaint视频修复实例初始化
-        self.sttn_inpaint = STTNInpaint()
+        self.sttn_inpaint = STTNInpaint(device, model_path)
         # 视频和掩码路径
         self.video_path = video_path
         self.mask_path = mask_path
@@ -248,7 +192,7 @@ class STTNVideoInpaint:
         )
         # 配置可在一次处理中加载的最大帧数
         if clip_gap is None:
-            self.clip_gap = config.STTN_MAX_LOAD_NUM
+            self.clip_gap = config.getSttnMaxLoadNum()
         else:
             self.clip_gap = clip_gap
 
@@ -277,8 +221,7 @@ class STTNVideoInpaint:
                 mask = mask[:, :, None]
                 
             # 得到修复区域位置
-            inpaint_area = self.sttn_inpaint.get_inpaint_area_by_mask(frame_info['H_ori'], split_h, mask)
-            
+            inpaint_area = get_inpaint_area_by_mask(frame_info['W_ori'], frame_info['H_ori'], split_h, mask)
             # 遍历每一次的迭代次数
             for i in range(rec_time):
                 start_f = i * self.clip_gap  # 起始帧位置
@@ -346,7 +289,7 @@ class STTNVideoInpaint:
                             if tbar is not None:
                                 input_sub_remover.update_progress(tbar, increment=1)
                             if original_frame is not None and input_sub_remover.gui_mode:
-                                input_sub_remover.preview_frame = cv2.hconcat([original_frame, frame])
+                                input_sub_remover.update_preview_with_comp(original_frame, frame)
         except Exception as e:
             print(f"Error during video processing: {str(e)}")
             # 不抛出异常，允许程序继续执行
@@ -360,7 +303,7 @@ if __name__ == '__main__':
     video_path = '../../test/test.mp4'
     # 记录开始时间
     start = time.time()
-    sttn_video_inpaint = STTNVideoInpaint(video_path, mask_path, clip_gap=config.STTN_MAX_LOAD_NUM)
+    sttn_video_inpaint = STTNAutoInpaint(video_path, mask_path, clip_gap=config.getSttnMaxLoadNum())
     sttn_video_inpaint()
     print(f'video generated at {sttn_video_inpaint.video_out_path}')
     print(f'time cost: {time.time() - start}')
