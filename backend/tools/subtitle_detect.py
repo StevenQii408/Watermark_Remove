@@ -1,3 +1,4 @@
+import os
 import sys
 from functools import cached_property
 
@@ -33,8 +34,8 @@ class SubtitleDetect:
         parser = utility.init_args()
         args = parser.parse_args([])
         args.det_algorithm = 'DB'
-        args.det_model_dir = model_config.convertToOnnxModelIfNeeded(model_config.DET_MODEL_DIR) if len(onnx_providers) > 0 else model_config.DET_MODEL_DIR
-        args.use_gpu=hardware_accelerator.has_cuda()
+        args.det_model_dir = os.path.join(model_config.DET_MODEL_DIR, 'inference.onnx') if len(onnx_providers) > 0 else model_config.DET_MODEL_DIR
+        args.use_gpu=False
         args.use_onnx=len(onnx_providers) > 0
         args.onnx_providers=onnx_providers
         return TextDetector(args)
