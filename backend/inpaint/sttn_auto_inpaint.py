@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from backend.config import config
 from backend.inpaint.sttn.auto_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+from backend.tools.inpaint_tools import get_inpaint_area_by_mask, is_frame_number_in_ab_sections
 
 # 定义图像预处理方式
 _to_tensors = transforms.Compose([
@@ -205,8 +205,11 @@ class STTNAutoInpaint:
             # 读取视频帧信息
             reader, frame_info = self.read_frame_info_from_video()
             if input_sub_remover is not None:
+                ab_sections = input_sub_remover.ab_sections
+                
                 writer = input_sub_remover.video_writer
             else:
+                ab_sections = None
                 # 创建视频写入对象，用于输出修复后的视频
                 writer = cv2.VideoWriter(self.video_out_path, cv2.VideoWriter_fourcc(*"mp4v"), frame_info['fps'], (frame_info['W_ori'], frame_info['H_ori']))
             
@@ -249,11 +252,12 @@ class STTNAutoInpaint:
                     frames_hr.append(image)
                     valid_frames_count += 1
                     
-                    for k in range(len(inpaint_area)):
-                        # 裁剪、缩放并添加到帧字典
-                        image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                        image_resize = cv2.resize(image_crop, (self.sttn_inpaint.model_input_width, self.sttn_inpaint.model_input_height))
-                        frames[k].append(image_resize)
+                    if is_frame_number_in_ab_sections(j, ab_sections):
+                        for k in range(len(inpaint_area)):
+                            # 裁剪、缩放并添加到帧字典
+                            image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]
+                            image_resize = cv2.resize(image_crop, (self.sttn_inpaint.model_input_width, self.sttn_inpaint.model_input_height))
+                            frames[k].append(image_resize)
                 
                 # 如果没有读取到有效帧，则跳过当前迭代
                 if valid_frames_count == 0:
@@ -269,6 +273,17 @@ class STTNAutoInpaint:
                 
                 # 如果有要修复的区域
                 if inpaint_area and valid_frames_count > 0:
+                    # 创建一个映射，记录哪些帧被处理了以及它们在frames[k]中的索引
+                    processed_frames_map = {}
+                    processed_idx = 0
+                    
+                    # 构建映射关系
+                    for j in range(start_f, end_f):
+                        if j - start_f < valid_frames_count and is_frame_number_in_ab_sections(j, ab_sections):
+                            processed_frames_map[j - start_f] = processed_idx
+                            processed_idx += 1
+                    
+                    # 应用修复结果
                     for j in range(valid_frames_count):
                         if input_sub_remover is not None and input_sub_remover.gui_mode:
                             original_frame = copy.deepcopy(frames_hr[j])
@@ -277,13 +292,16 @@ class STTNAutoInpaint:
                             
                         frame = frames_hr[j]
                         
-                        for k in range(len(inpaint_area)):
-                            if j < len(comps[k]):  # 确保索引有效
-                                # 将修复的图像重新扩展到原始分辨率，并融合到原始帧
-                                comp = cv2.resize(comps[k][j], (frame_info['W_ori'], split_h))
-                                comp = cv2.cvtColor(np.array(comp).astype(np.uint8), cv2.COLOR_BGR2RGB)
-                                mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]
-                                frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = mask_area * comp + (1 - mask_area) * frame[inpaint_area[k][0]:inpaint_area[k][1], :, :]
+                        # 只有被处理过的帧才应用修复结果
+                        if j in processed_frames_map:
+                            comp_idx = processed_frames_map[j]
+                            for k in range(len(inpaint_area)):
+                                if comp_idx < len(comps[k]):  # 确保索引有效
+                                    # 将修复的图像重新扩展到原始分辨率，并融合到原始帧
+                                    comp = cv2.resize(comps[k][comp_idx], (frame_info['W_ori'], split_h))
+                                    comp = cv2.cvtColor(np.array(comp).astype(np.uint8), cv2.COLOR_BGR2RGB)
+                                    mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]
+                                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = mask_area * comp + (1 - mask_area) * frame[inpaint_area[k][0]:inpaint_area[k][1], :, :]
                         
                         writer.write(frame)
                         

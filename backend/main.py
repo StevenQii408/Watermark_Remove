@@ -84,6 +84,8 @@ class SubtitleRemover:
         self.is_successful_merged = False
         # 进度监听器列表
         self.progress_listeners = []
+        # inpaint的frame_no区域列表, 默认为inpaint所有帧
+        self.ab_sections = None
 
     @staticmethod
     def is_current_frame_no_start(frame_no, continuous_frame_no_list):
@@ -180,6 +182,7 @@ class SubtitleRemover:
                 self.video_writer.write(frame)
                 # self.append_output(f'write frame: {index}')
                 self.update_progress(tbar, increment=1)
+                self.update_preview_with_comp(frame, frame)
                 continue
             # 如果有水印，判断该帧是不是开头帧
             else:
@@ -328,6 +331,7 @@ class SubtitleRemover:
     def run(self):
         # 记录开始时间
         start_time = time.time()
+        self.append_output(tr['Main']['ABSection'].format(str(self.ab_sections).replace("range", "") if self.ab_sections is not None and len(self.ab_sections) > 0 else tr['Main']['ABSectionAll']))
         # 如果使用GPU加速，则打印GPU加速提示
         if self.hardware_accelerator.has_accelerator():
             accelerator_name = self.hardware_accelerator.accelerator_name
