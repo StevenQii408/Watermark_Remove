@@ -462,7 +462,10 @@ if __name__ == '__main__':
     multiprocessing.set_start_method("spawn")
     from backend.tools.args_handler import parse_args
     args = parse_args()
-    
+    # force english
+    config.set(config.interface, 'en')
+    TRANSLATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'interface', f"{config.interface.value}.ini")
+    tr.read(TRANSLATION_FILE, encoding='utf-8')
     print('Subtitle Area:', 'fullscreen' if len(args.subtitle_area_coords) <= 0 else args.subtitle_area_coords)
     sr = SubtitleRemover(args.input, sub_areas=args.subtitle_area_coords)
     if not is_video_or_image(args.input):
