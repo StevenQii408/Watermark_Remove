@@ -39,8 +39,8 @@ class Config(QConfig):
     windowH = ConfigItem("Window", "Height", 1200)
 
     # 使用一个配置项存储所有选区
-    # 默认值为一个选区，格式为："x,y,w,h;x,y,w,h;..."，分号分隔不同选区
-    subtitleSelectionAreas = ConfigItem("Main", "SubtitleSelectionAreas", "0.15,0.88,0.70,0.11")
+    # 默认值为一个选区，格式为："ymin,ymax,xmin,xmax;ymin,ymax,xmin,xmax;..."，分号分隔不同选区
+    subtitleSelectionAreas = ConfigItem("Main", "SubtitleSelectionAreas", "0.88,0.99,0.15,0.85")
 
     """
     MODE可选算法类型
