@@ -11,7 +11,7 @@ class VideoDisplayComponent(QWidget):
     """视频显示组件，包含视频预览和选择框功能"""
     
     # 定义信号
-    selection_changed = Signal(list)  # 选择框变化信号
+    selections_changed = Signal(list)  # 选择框变化信号
     ab_sections_changed = Signal(list)  # AB分区变化信号
     
     def __init__(self, parent=None):
@@ -22,7 +22,6 @@ class VideoDisplayComponent(QWidget):
         self.is_drawing = False
         self.selection_rect = QRect()  # 当前正在绘制或调整的选区
         self.selection_rects = []  # 存储多个选区
-        self.selection_ratios = []  # 存储多个选区的比例
         self.active_selection_index = -1  # 当前活动选区的索引
         self.drag_start_pos = None
         self.resize_edge = None
@@ -254,21 +253,6 @@ class VideoDisplayComponent(QWidget):
         self.current_pixmap = rounded_pix.copy()
         
         self.video_display.setPixmap(rounded_pix)
-        
-        # 如果有保存的选择框比例，根据新视频尺寸重新计算选择框
-        if draw_selection and self.selection_ratios and self.scaled_width and self.scaled_height:
-            self.selection_rects = []
-            for ratio in self.selection_ratios:
-                x_ratio, y_ratio, w_ratio, h_ratio = ratio
-                
-                # 计算新的选择框坐标和大小
-                x = int(x_ratio * self.scaled_width) + self.border_left
-                y = int(y_ratio * self.scaled_height) + self.border_top
-                w = int(w_ratio * self.scaled_width)
-                h = int(h_ratio * self.scaled_height)
-                
-                # 创建新的选择框
-                self.selection_rects.append(QRect(x, y, w, h))
             
         # 更新视频显示
         self.update_preview_with_rect(draw_selection=draw_selection)
@@ -376,10 +360,9 @@ class VideoDisplayComponent(QWidget):
         # 检测双击，重置所有选区
         if event.type() == QtCore.QEvent.MouseButtonDblClick:
             self.selection_rects = []
-            self.selection_ratios = []
             self.active_selection_index = -1
             self.update_preview_with_rect()
-            self.selection_changed.emit(self.selection_rects)
+            self.selections_changed.emit(self.selection_rects)
             return
         
         # 如果按下Ctrl键，开始绘制新选区
@@ -572,23 +555,17 @@ class VideoDisplayComponent(QWidget):
                 self.selection_rects.append(self.selection_rect)
                 self.active_selection_index = len(self.selection_rects) - 1
                 
-                # 保存选择框的相对位置和大小
-                self.save_selections_to_configs()
-                
                 # 发送选择框变化信号
-                self.selection_changed.emit(self.selection_rects)
+                self.selections_changed.emit(self.selection_rects)
             
             self.is_drawing = False
             self.selection_rect = QRect()
         elif self.resize_edge and self.active_selection_index >= 0:
             # 标准化选择框
             self.selection_rects[self.active_selection_index] = self.selection_rects[self.active_selection_index].normalized()
-            
-            # 保存选择框的相对位置和大小
-            self.save_selections_to_configs()
-            
+                        
             # 发送选择框变化信号
-            self.selection_changed.emit(self.selection_rects)
+            self.selections_changed.emit(self.selection_rects)
             
             self.resize_edge = None
         
@@ -678,14 +655,16 @@ class VideoDisplayComponent(QWidget):
         """获取选择框坐标"""
         return self.selection_rect
     
-    def set_selection_rect(self, rect):
+    def set_selection_rects(self, rects):
         """设置选择框"""
-        self.selection_rect = rect
-        self.save_selections_to_config()
+        self.selection_rects = rects
+        self.selection_rect = rects[-1] if rects else QRect()
+        self.active_selection_index = len(rects) - 1
         self.update_preview_with_rect()
     
     def load_selections_from_config(self):
         """从配置中加载选择框的相对位置和大小"""
+        print("Loading selections from config...")
         # 检查是否有有效的视频尺寸
         if not self.scaled_width or not self.scaled_height:
             return False
@@ -699,7 +678,6 @@ class VideoDisplayComponent(QWidget):
 
         # 清空现有选区
         self.selection_rects = []
-        self.selection_ratios = []
         
         # 解析所有选区
         for area_str in areas_str.split(';'):
@@ -717,9 +695,6 @@ class VideoDisplayComponent(QWidget):
                 if w_ratio <= 0.01 or h_ratio <= 0.005:
                     continue
                     
-                # 保存选择框比例
-                self.selection_ratios.append((x_ratio, y_ratio, w_ratio, h_ratio))
-                
                 # 计算实际像素坐标
                 x = int(x_ratio * self.scaled_width) + self.border_left
                 y = int(y_ratio * self.scaled_height) + self.border_top
@@ -736,41 +711,17 @@ class VideoDisplayComponent(QWidget):
             self.active_selection_index = len(self.selection_rects) - 1
         else:
             self.active_selection_index = -1
-            
+        self.selections_changed.emit(self.selection_rects)
+
         # 更新预览
         self.update_preview_with_rect()
         
         return len(self.selection_rects) > 0
-        
-    def save_selections_to_config(self):
-        """保存所有选择框的相对位置和大小"""
-        if not self.scaled_width or not self.scaled_height:
-            return
-            
-        self.selection_ratios = []
-        areas_str_parts = []
-        
-        for rect in self.selection_rects:
-            # 计算相对于实际视频的位置和大小比例
-            x_ratio = (rect.x() - self.border_left) / self.scaled_width if self.scaled_width > 0 else 0
-            y_ratio = (rect.y() - self.border_top) / self.scaled_height if self.scaled_height > 0 else 0
-            w_ratio = rect.width() / self.scaled_width if self.scaled_width > 0 else 0
-            h_ratio = rect.height() / self.scaled_height if self.scaled_height > 0 else 0
-            
-            # 添加到比例列表
-            self.selection_ratios.append((x_ratio, y_ratio, w_ratio, h_ratio))
-            
-            # 添加到字符串部分
-            areas_str_parts.append(f"{x_ratio},{y_ratio},{w_ratio},{h_ratio}")
-        
-        # 更新配置
-        config.subtitleSelectionAreas.value = ";".join(areas_str_parts)
-        qconfig.save()
     
-    def get_original_coordinates(self):
+    def preview_coordinates_to_video_coordinates(self, preview_selection_rects):
         """获取选择框在原始视频中的坐标"""
         selection_rects = []
-        for rect in self.selection_rects:
+        for rect in preview_selection_rects:
             if not rect.isValid() or not self.scaled_width or not self.scaled_height:
                 continue
                 
@@ -806,12 +757,11 @@ class VideoDisplayComponent(QWidget):
         self.video_display.setMouseTracking(enabled)
         self.video_display.setCursor(Qt.ArrowCursor)
 
-    def save_selections_to_configs(self):
+    def save_selections_to_config(self):
         """保存所有选择框的相对位置和大小"""
         if not self.scaled_width or not self.scaled_height:
             return
             
-        self.selection_ratios = []
         areas_str_parts = []
         
         for rect in self.selection_rects:
@@ -820,9 +770,6 @@ class VideoDisplayComponent(QWidget):
             y_ratio = round((rect.y() - self.border_top) / self.scaled_height if self.scaled_height > 0 else 0, 4)
             w_ratio = round(rect.width() / self.scaled_width if self.scaled_width > 0 else 0, 4)
             h_ratio = round(rect.height() / self.scaled_height if self.scaled_height > 0 else 0, 4)
-            
-            # 添加到比例列表
-            self.selection_ratios.append((x_ratio, y_ratio, w_ratio, h_ratio))
             
             # 添加到字符串部分
             areas_str_parts.append(f"{x_ratio},{y_ratio},{w_ratio},{h_ratio}")
@@ -840,32 +787,27 @@ class VideoDisplayComponent(QWidget):
     def clear_selections(self):
         """清除所有选区"""
         self.selection_rects = []
-        self.selection_ratios = []
         self.active_selection_index = -1
         self.update_preview_with_rect()
-        self.selection_changed.emit(self.selection_rects)
+        self.selections_changed.emit(self.selection_rects)
 
     def __handle_delete_selection(self):
         """处理删除当前选区的逻辑"""
         if self.active_selection_index >= 0 and self.selection_rects:
             # 删除当前活跃选区
             self.selection_rects.pop(self.active_selection_index)
-            if self.selection_ratios:
-                self.selection_ratios.pop(self.active_selection_index)
             
             # 如果还有其他选区，将最后一个选区设为活跃选区
             if self.selection_rects:
                 self.active_selection_index = len(self.selection_rects) - 1
             else:
                 self.active_selection_index = -1
-
-            self.save_selections_to_configs()
             
             # 更新显示
             self.update_preview_with_rect()
             
             # 发送选区变化信号
-            self.selection_changed.emit(self.selection_rects)
+            self.selections_changed.emit(self.selection_rects)
             return True
 
     def __handle_mark_for_ab_start(self):

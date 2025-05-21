@@ -20,6 +20,7 @@ class TaskStatus(Enum):
 @unique
 class TaskOptions(Enum):
     AB_SECTIONS = "ab_sections"
+    SUB_AREAS = "sub_areas"
 
 @dataclass
 class Task:
