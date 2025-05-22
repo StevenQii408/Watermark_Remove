@@ -4,7 +4,6 @@ import threading
 import multiprocessing
 import time
 import traceback
-from pathlib import Path
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
 from PySide6.QtCore import Slot, QRect, Signal
 from PySide6 import QtWidgets
@@ -13,7 +12,7 @@ from ui.setting_interface import SettingInterface
 from ui.component.video_display_component import VideoDisplayComponent
 from ui.component.task_list_component import TaskListComponent, TaskStatus, TaskOptions
 from ui.icon.my_fluent_icon import MyFluentIcon
-from backend.config import tr
+from backend.config import config, tr
 from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
 from backend.tools.common_tools import get_readable_path, is_image_file, read_image
@@ -344,12 +343,17 @@ class HomeInterface(QWidget):
                                 if key == TaskOptions.SUB_AREAS.value:
                                     value = self.video_display_component.preview_coordinates_to_video_coordinates(value)
                                 options[key] = value
-                            process = self.run_subtitle_remover_process(task.path, task.output_path, options)
+                            # 清理缓存, 使用动态路径
+                            task.output_path = None
+                            output_path = task.output_path
+                            process = self.run_subtitle_remover_process(task.path, output_path, options)
                             
                             # 更新任务状态为已完成
                             task = self.task_list_component.get_task(self.current_processing_task_index)
                             if process.exitcode == 0 and task and task.status == TaskStatus.PROCESSING:
                                 self.progress_signal.emit(100, True)
+                                # 任务完成, 更新输出路径为只读
+                                task.output_path = output_path
                                 self.task_list_component.update_task_status(self.current_processing_task_index, TaskStatus.COMPLETED)
                             else:
                                 self.task_list_component.update_task_status(self.current_processing_task_index, TaskStatus.FAILED)
@@ -584,11 +588,7 @@ class HomeInterface(QWidget):
             # 正序添加, 确保任务列表顺序一致
             for path in reversed(files_loaded):
                 # 添加到任务列表
-                if is_image_file(path):
-                    output_path = os.path.abspath(os.path.join(os.path.dirname(path), f'{Path(path).stem}_no_sub.png'))
-                else:
-                    output_path = os.path.abspath(os.path.join(os.path.dirname(path), f'{Path(path).stem}_no_sub.mp4'))
-                self.task_list_component.add_task(path, output_path)
+                self.task_list_component.add_task(path)
                 index = max(0, self.task_list_component.find_task_index_by_path(path))
                 self.task_list_component.select_task(index)
 
