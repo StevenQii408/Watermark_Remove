@@ -243,6 +243,7 @@ LAMA_SUPER_FAST = False  # 保证效果
 | lyons                        | 100.00 RMB | 金牌赞助席位 |
 | TalkLuv                   | 50.00 RMB  | 银牌赞助席位 |
 | 陈凯                        | 50.00 RMB  | 银牌赞助席位 |
+| Freeman                   | 30.00 RMB  | 银牌赞助席位 |
 | Tshuang                   | 20.00 RMB  | 银牌赞助席位 |
 | 很奇异                       | 15.00 RMB  | 银牌赞助席位 |
 | 郭鑫                       | 12.00 RMB  | 银牌赞助席位 |
