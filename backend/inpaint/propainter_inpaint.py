@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 import os
 import cv2
+import copy
 import numpy as np
 import scipy.ndimage
 from PIL import Image
+from typing import List
 
 import torch
 import torchvision
@@ -14,11 +16,11 @@ from backend.inpaint.video.model.recurrent_flow_completion import RecurrentFlowC
 from backend.inpaint.video.model.propainter import InpaintGenerator
 from backend.inpaint.video.core.utils import to_tensors
 from backend.inpaint.video.model.misc import get_device
+from backend.tools.inpaint_tools import get_inpaint_area_by_mask
 
 import warnings
 
 warnings.filterwarnings("ignore")
-
 
 def binary_mask(mask, th=0.1):
     mask[mask > th] = 1
@@ -33,6 +35,11 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
     flow_masks = []
     # 如果传入的直接为numpy array
     if isinstance(mpath, np.ndarray):
+        if mpath.ndim == 3 and mpath.shape[2] == 1:
+            mpath = mpath.squeeze(2)  # 从 (H,W,1) 转为 (H,W)
+        elif mpath.ndim == 3 and mpath.shape[2] == 3:
+            # 如果是彩色图像，转为灰度
+            mpath = cv2.cvtColor(mpath, cv2.COLOR_BGR2GRAY)
         masks_img = [Image.fromarray(mpath)]
     # input single img path
     else:
@@ -129,9 +136,10 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
     return ref_index
 
 
-class VideoInpaint:
-    def __init__(self, sub_video_length=config.PROPAINTER_MAX_LOAD_NUM, use_fp16=True):
-        self.device = get_device()
+class PropainterInpaint:
+    def __init__(self, device, model_dir, sub_video_length=80, use_fp16=True):
+        self.device = device
+        self.model_dir = model_dir
         self.use_fp16 = use_fp16
         self.use_half = True if self.use_fp16 else False
         if self.device == torch.device('cpu'):
@@ -157,21 +165,27 @@ class VideoInpaint:
 
     def init_raft_model(self):
         # set up RAFT and flow competition model
-        return RAFT_bi(os.path.join(config.VIDEO_INPAINT_MODEL_PATH, 'raft-things.pth'), self.device)
+        return RAFT_bi(os.path.join(self.model_dir, 'raft-things.pth'), self.device)
 
     def init_fix_flow_model(self):
         fix_flow_complete_model = RecurrentFlowCompleteNet(
-            os.path.join(config.VIDEO_INPAINT_MODEL_PATH, 'recurrent_flow_completion.pth'))
+            os.path.join(self.model_dir, 'recurrent_flow_completion.pth'))
         for p in fix_flow_complete_model.parameters():
             p.requires_grad = False
+            
+        if self.use_half:
+            fix_flow_complete_model = fix_flow_complete_model.half()
         fix_flow_complete_model.to(self.device)
         fix_flow_complete_model.eval()
         return fix_flow_complete_model
 
     def init_inpaint_model(self):
         # set up ProPainter model
-        return InpaintGenerator(model_path=os.path.join(config.VIDEO_INPAINT_MODEL_PATH, 'ProPainter.pth')).to(
-            self.device).eval()
+        model = InpaintGenerator(model_path=os.path.join(self.model_dir, 'ProPainter.pth'))
+        if self.use_half:
+            model = model.half()
+        model = model.to(self.device).eval()
+        return model
 
     def inpaint(self, frames, mask):
         if isinstance(frames[0], np.ndarray):
@@ -235,8 +249,6 @@ class VideoInpaint:
             if self.use_half:
                 frames, flow_masks, masks_dilated = frames.half(), flow_masks.half(), masks_dilated.half()
                 gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
-                fix_flow_complete = self.fix_flow_complete.half()
-                self.model = self.model.half()
 
             # ---- complete flow ----
             flow_length = gt_flows_bi[0].size(1)
@@ -248,10 +260,10 @@ class VideoInpaint:
                     e_f = min(flow_length, f + self.sub_video_length + pad_len)
                     pad_len_s = max(0, f) - s_f
                     pad_len_e = e_f - min(flow_length, f + self.sub_video_length)
-                    pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
+                    pred_flows_bi_sub, _ = self.fix_flow_complete.forward_bidirect_flow(
                         (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
                         flow_masks[:, s_f:e_f + 1])
-                    pred_flows_bi_sub = fix_flow_complete.combine_flow(
+                    pred_flows_bi_sub = self.fix_flow_complete.combine_flow(
                         (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
                         pred_flows_bi_sub,
                         flow_masks[:, s_f:e_f + 1])
@@ -264,8 +276,8 @@ class VideoInpaint:
                 pred_flows_b = torch.cat(pred_flows_b, dim=1)
                 pred_flows_bi = (pred_flows_f, pred_flows_b)
             else:
-                pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
-                pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
+                pred_flows_bi, _ = self.fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
+                pred_flows_bi = self.fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
                 torch.cuda.empty_cache()
 
             # ---- image propagation ----
@@ -348,6 +360,59 @@ class VideoInpaint:
         comp_frames = [cv2.cvtColor(i, cv2.COLOR_RGB2BGR) for i in comp_frames]
         return comp_frames
 
+    def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
+        """
+        :param input_frames: 原视频帧
+        :param input_mask: 字幕区域mask
+        """
+        mask = input_mask[:, :, None]
+        H_ori, W_ori = mask.shape[:2]
+        H_ori = int(H_ori + 0.5)
+        W_ori = int(W_ori + 0.5)
+        # 确定去字幕的垂直高度部分
+        split_h = int(W_ori * 3 / 16)
+        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask, multiple=8)
+        # 初始化帧存储变量
+        # 高分辨率帧存储列表
+        frames_hr = copy.deepcopy(input_frames)
+        frames_scaled = {}  # 存放缩放后帧的字典
+        masks_scaled = {}  # 存放缩放后遮罩的字典
+        comps = {}  # 存放补全后帧的字典
+        # 存储最终的视频帧
+        inpainted_frames = []
+        for k in range(len(inpaint_area)):
+            frames_scaled[k] = []  # 为每个去除部分初始化一个列表
+            masks_scaled[k] = []  # 为每个去除部分初始化一个列表
+
+        # 读取并缩放帧
+        for j in range(len(frames_hr)):
+            image = frames_hr[j]
+            # 对每个去除部分进行切割和缩放
+            for k in range(len(inpaint_area)):
+                image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]  # 切割
+                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]  # 切割
+                frames_scaled[k].append(image_crop)  # 将缩放后的帧添加到对应列表
+                masks_scaled[k].append(mask_crop)  # 将缩放后的遮罩添加到对应列表
+
+        # 处理每一个去除部分
+        for k in range(len(inpaint_area)):
+            # 调用inpaint函数进行处理
+            comps[k] = self.inpaint(frames_scaled[k], masks_scaled[k][0])
+
+        # 如果存在去除部分
+        if inpaint_area:
+            for j in range(len(frames_hr)):
+                frame = frames_hr[j]  # 取出原始帧
+                # 对于模式中的每一个段落
+                for k in range(len(inpaint_area)):
+                    comp = comps[k][j]  # 获取补全后的帧
+                    # 实现遮罩区域内的图像融合
+                    frame[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :] = comp
+                # 将最终帧添加到列表
+                inpainted_frames.append(frame)
+                # print(f'processing frame, {len(frames_hr) - j} left')
+        return inpainted_frames
+
 
 def read_frames(v_path):
     video_cap = cv2.VideoCapture(v_path)
@@ -362,11 +427,11 @@ def read_frames(v_path):
 
 
 if __name__ == '__main__':
-    # VideoInpaint
-    video_inpaint = VideoInpaint(sub_video_length=80)
+    # PropainterInpaint
+    propainter_inpaint = PropainterInpaint(get_device(), ModelConfig().PROPAINTER_MODEL_DIR, sub_video_length=80)
     frames = read_frames('/home/yao/Documents/Project/video-subtitle-remover/local_test/test1.mp4')
     mask = cv2.imread('/home/yao/Documents/Project/video-subtitle-remover/local_test/test1_mask.png')
-    inpainted_frames = video_inpaint.inpaint(frames, mask)
+    inpainted_frames = propainter_inpaint.inpaint(frames, mask)
     save_root = '/home/yao/Documents/Project/video-subtitle-remover/local_test/'
     video_out_path = os.path.join(save_root, 'inpaint_out.mp4')
     print("size: ", inpainted_frames[0].shape)
