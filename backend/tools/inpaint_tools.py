@@ -5,6 +5,28 @@ import numpy as np
 from backend.config import config
 
 
+def ensure_bgr_uint8(image, shape=None):
+    """Normalize an image to a contiguous BGR uint8 array."""
+    array = np.asarray(image)
+    if array.ndim == 2:
+        array = cv2.cvtColor(array, cv2.COLOR_GRAY2BGR)
+    elif array.ndim == 3 and array.shape[2] == 4:
+        array = array[:, :, :3]
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("image must have shape HxWx3")
+    if array.dtype != np.uint8:
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    if shape is not None and array.shape[:2] != tuple(shape):
+        array = cv2.resize(array, (int(shape[1]), int(shape[0])), interpolation=cv2.INTER_LINEAR)
+    return np.ascontiguousarray(array)
+
+
+def binary_mask_uint8(mask, shape=None):
+    """Normalize a mask to a single-channel binary uint8 array (0 or 255)."""
+    normalized = normalize_mask(mask, shape)
+    return np.ascontiguousarray((normalized > 0.5).astype(np.uint8) * 255)
+
+
 def normalize_mask(mask, shape=None):
     """Return a clipped single-channel float mask in the range [0, 1]."""
     array = np.asarray(mask)
@@ -24,17 +46,64 @@ def normalize_mask(mask, shape=None):
 
 def alpha_blend(original, generated, mask):
     """Blend generated pixels only where the normalized mask is active."""
-    source = np.asarray(original)
-    replacement = np.asarray(generated)
+    source = ensure_bgr_uint8(original)
+    replacement = ensure_bgr_uint8(generated, source.shape[:2])
     alpha = normalize_mask(mask, source.shape[:2])[:, :, None]
-    if replacement.ndim == 2:
-        replacement = cv2.cvtColor(replacement, cv2.COLOR_GRAY2BGR)
-    if replacement.shape != source.shape:
-        replacement = cv2.resize(replacement, (source.shape[1], source.shape[0]), interpolation=cv2.INTER_LINEAR)
     if not np.isfinite(replacement).all():
         return source.copy()
     result = replacement.astype(np.float32) * alpha + source.astype(np.float32) * (1.0 - alpha)
     return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def expand_solid_background_mask(frame, mask, max_area_ratio=8.0):
+    """Include a locally uniform subtitle panel around OCR text when reliable."""
+    image = ensure_bgr_uint8(frame)
+    binary = (normalize_mask(mask) > 0.5).astype(np.uint8)
+    if not np.any(binary):
+        return binary_mask_uint8(binary)
+    height, width = binary.shape
+    result = binary.copy()
+    count, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    for index in range(1, count):
+        x, y, box_width, box_height, area = stats[index]
+        if area < 10:
+            continue
+        pad_x = max(16, int(box_width * 1.6))
+        pad_y = max(10, int(box_height * 1.4))
+        x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+        x2, y2 = min(width, x + box_width + pad_x), min(height, y + box_height + pad_y)
+        roi_mask = binary[y1:y2, x1:x2]
+        roi_lab = lab_image[y1:y2, x1:x2]
+        ring = cv2.dilate(roi_mask, np.ones((5, 5), np.uint8)) - roi_mask
+        ring_pixels = roi_lab[ring > 0]
+        if len(ring_pixels) < 20:
+            continue
+        reference = np.median(ring_pixels, axis=0)
+        distance = np.linalg.norm(roi_lab - reference, axis=2)
+        local_variance = float(np.mean(np.var(ring_pixels, axis=0)))
+        threshold = min(42.0, max(14.0, local_variance * 1.8 + 10.0))
+        candidate = (distance <= threshold).astype(np.uint8)
+        candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        candidate[roi_mask > 0] = 1
+        candidate_area = int(candidate.sum())
+        roi_area = max(1, candidate.shape[0] * candidate.shape[1])
+        if candidate_area < area * 1.4 or candidate_area > roi_area * 0.85:
+            continue
+        candidate_count, candidate_labels, candidate_stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
+        selected = None
+        text_center_x = x - x1 + box_width / 2.0
+        text_center_y = y - y1 + box_height / 2.0
+        for candidate_index in range(1, candidate_count):
+            cx, cy, cw, ch, carea = candidate_stats[candidate_index]
+            if (cx <= text_center_x <= cx + cw and cy <= text_center_y <= cy + ch):
+                if carea <= area * max_area_ratio:
+                    selected = candidate_labels == candidate_index
+                    break
+        if selected is not None:
+            result[y1:y2, x1:x2] |= selected.astype(np.uint8)
+    return result.astype(np.uint8) * 255
 
 
 def get_local_inpaint_areas(mask, context_x=0.35, context_y=1.0, multiple=1):

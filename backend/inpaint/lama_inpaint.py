@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 from backend.inpaint.utils.lama_util import prepare_img_and_mask, get_image, pad_img_to_modulo
 from backend import config
-from backend.tools.inpaint_tools import alpha_blend, get_inpaint_area_by_mask, normalize_mask
+from backend.tools.inpaint_tools import alpha_blend, binary_mask_uint8, get_inpaint_area_by_mask, normalize_mask
 
 class LamaInpaint:
     def __init__(self, device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), model_path='big-lama.pt') -> None:
@@ -60,9 +60,6 @@ class LamaInpaint:
                 results[start + i] = batch_results[i][:orig_height, :orig_width]
 
             del img_tensor, mask_tensor, padded_imgs, padded_masks
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
         return results
 
     def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
@@ -89,7 +86,7 @@ class LamaInpaint:
             cropped_masks = []
             for j in range(len(frames_hr)):
                 image_crop = frames_hr[j][inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], :]
+                mask_crop = binary_mask_uint8(mask[inpaint_area[k][0]:inpaint_area[k][1], :])
                 cropped_frames.append(image_crop)
                 cropped_masks.append(mask_crop)
 
@@ -111,7 +108,7 @@ class LamaInpaint:
             # 无需处理的区域，返回原始帧
             inpainted_frames = frames_hr
 
-        if torch.cuda.is_available():
+        if self.device.type == "cuda":
             torch.cuda.empty_cache()
         return inpainted_frames
 

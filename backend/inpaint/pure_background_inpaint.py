@@ -23,9 +23,20 @@ class PureBackgroundInpaint:
         if ring.sum() < 32:
             return False
         values = []
-        for frame in frames[::max(1, len(frames) // self.temporal_window)]:
+        temporal_reference = None
+        sample_frames = frames[::max(1, len(frames) // self.temporal_window)]
+        for frame in sample_frames:
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
-            values.append(lab[ring].var(axis=0).mean())
+            ring_lab = lab[ring]
+            values.append(ring_lab.var(axis=0).mean())
+            if temporal_reference is None:
+                temporal_reference = np.median(ring_lab, axis=0)
+            elif np.linalg.norm(np.median(ring_lab, axis=0) - temporal_reference) > max(8.0, self.variance_threshold * 0.08):
+                return False
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 120)
+            if float(np.count_nonzero(edges[ring])) / max(1, int(ring.sum())) > 0.35:
+                return False
         return float(np.mean(values)) <= self.variance_threshold
 
     @staticmethod

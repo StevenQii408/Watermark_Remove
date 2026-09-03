@@ -59,6 +59,7 @@ class FFmpegVideoWriter:
 
     def __init__(self, output_path, fps, size):
         w, h = size
+        self.size = (int(w), int(h))
         cmd = [
             FFmpegCLI.instance().ffmpeg_path,
             '-y',
@@ -84,8 +85,19 @@ class FFmpegVideoWriter:
 
     def write(self, frame):
         """写入一帧（numpy BGR 数组）。"""
+        frame = np.asarray(frame)
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            frame = frame[:, :, :3]
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            return
+        if frame.shape[:2] != (self.size[1], self.size[0]):
+            frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_LINEAR)
         if frame.dtype != np.uint8:
             frame = np.clip(frame, 0, 255).astype(np.uint8)
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
         try:
             self._process.stdin.write(frame.tobytes())
         except BrokenPipeError:

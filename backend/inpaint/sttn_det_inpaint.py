@@ -12,7 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from backend.config import config
 from backend.inpaint.sttn.network_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
-from backend.tools.inpaint_tools import alpha_blend, get_local_inpaint_areas, normalize_mask
+from backend.tools.inpaint_tools import (alpha_blend, binary_mask_uint8,
+                                          ensure_bgr_uint8, get_local_inpaint_areas,
+                                          normalize_mask)
 
 # 定义图像预处理方式
 _to_tensors = transforms.Compose([
@@ -41,6 +43,7 @@ class STTNDetInpaint:
         :param input_frames: 原视频帧
         :param mask: 字幕区域mask
         """
+        input_frames = [ensure_bgr_uint8(frame) for frame in input_frames]
         mask = normalize_mask(input_mask)
         H_ori, W_ori = mask.shape[:2]
         H_ori = int(H_ori + 0.5)
@@ -66,7 +69,9 @@ class STTNDetInpaint:
                 image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]
                 mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3]]
                 image_resize = cv2.resize(image_crop, (self.model_input_width, self.model_input_height))  # 缩放
-                mask_resize = (cv2.resize(mask_crop, (self.model_input_width, self.model_input_height)) * 255).astype(np.uint8)
+                mask_resize = binary_mask_uint8(
+                    cv2.resize(mask_crop, (self.model_input_width, self.model_input_height),
+                               interpolation=cv2.INTER_NEAREST))
                 frames_scaled[k].append(image_resize)  # 将缩放后的帧添加到对应列表
                 masks_scaled[k].append(mask_resize)  # 将缩放后的遮罩添加到对应列表
 
@@ -128,7 +133,7 @@ class STTNDetInpaint:
 
         binary_masks = [np.expand_dims((normalize_mask(m) > 0.5).astype(np.float32), 2) for m in masks]
         # 将掩码转换为张量
-        mask_images = [(normalize_mask(m) * 255).astype(np.uint8) for m in masks]
+        mask_images = [binary_mask_uint8(m) for m in masks]
         masks_tensor = (_to_tensors(mask_images).unsqueeze(0) > 0.5).float()
 
         # 把特征张量转移到指定的设备（CPU或GPU）

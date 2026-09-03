@@ -21,7 +21,8 @@ from backend.inpaint.lama_inpaint import LamaInpaint
 from backend.inpaint.opencv_inpaint import OpenCVInpaint
 from backend.inpaint.pure_background_inpaint import PureBackgroundInpaint
 from backend.inpaint.propainter_inpaint import PropainterInpaint
-from backend.tools.inpaint_tools import create_mask, batch_generator, expand_frame_ranges
+from backend.tools.inpaint_tools import (create_mask, batch_generator, ensure_bgr_uint8,
+                                          expand_frame_ranges, expand_solid_background_mask)
 from backend.tools.model_config import ModelConfig
 from backend.tools.ffmpeg_cli import FFmpegCLI
 from backend.tools.subtitle_detect import SubtitleDetect
@@ -86,6 +87,8 @@ class SubtitleRemover:
         self.progress_listeners = []
         # inpaint的frame_no区域列表, 默认为inpaint所有帧
         self.ab_sections = None
+        self._preview_interval = 6
+        self._preview_counter = 0
 
     @staticmethod
     def is_current_frame_no_start(frame_no, continuous_frame_no_list):
@@ -163,6 +166,27 @@ class SubtitleRemover:
         """
         pass
 
+    def emit_preview(self, frame_ori, frame_comp, mask=None, force=False):
+        """Throttle GUI preview work without affecting video processing."""
+        if not self.gui_mode:
+            return
+        self._preview_counter += 1
+        if not force and self._preview_counter % self._preview_interval:
+            return
+        preview_frame = ensure_bgr_uint8(frame_ori)
+        if mask is not None:
+            preview_mask = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
+            preview_frame = np.clip(
+                preview_frame.astype(np.float32) + preview_mask * 80.0,
+                0, 255).astype(np.uint8)
+        self.update_preview_with_comp(preview_frame, ensure_bgr_uint8(frame_comp))
+
+    @staticmethod
+    def enrich_solid_background_mask(frame, mask):
+        if config.pureBackgroundMode.value == "off":
+            return mask
+        return expand_solid_background_mask(frame, mask)
+
     def write_original_video(self, tbar):
         """Pass through the source frames when no text was detected."""
         self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -204,7 +228,7 @@ class SubtitleRemover:
                 self.video_writer.write(frame)
                 # self.append_output(f'write frame: {index}')
                 self.update_progress(tbar, increment=1)
-                self.update_preview_with_comp(frame, frame)
+                self.emit_preview(frame, frame)
                 continue
             # 如果有水印，判断该帧是不是开头帧
             else:
@@ -238,8 +262,10 @@ class SubtitleRemover:
                         elif len(temp_frames) == 1:
                             inner_index += 1
                             single_mask = create_mask(self.mask_size, sub_list[start_frame_no])
+                            single_mask = self.enrich_solid_background_mask(temp_frames[0], single_mask)
                             inpainted_frame = self.lama_inpaint.inpaint(temp_frames[0], single_mask)
                             self.video_writer.write(inpainted_frame)
+                            self.emit_preview(temp_frames[0], inpainted_frame, single_mask, force=True)
                             # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
                             self.update_progress(tbar, increment=1)
                             continue
@@ -247,6 +273,7 @@ class SubtitleRemover:
                             # 将读取的视频帧分批处理
                             # 1. 获取当前批次使用的mask
                             mask = create_mask(self.mask_size, sub_list[start_frame_no])
+                            mask = self.enrich_solid_background_mask(temp_frames[0], mask)
                             self.append_output(tr['Main']['InpaintMaskStats'].format(
                                 int(np.count_nonzero(mask)), mask.shape[1], mask.shape[0]))
                             if not np.any(mask):
@@ -264,16 +291,22 @@ class SubtitleRemover:
                                 if pure_frames is not None or pure_mode == "force":
                                     output_frames = (pure_frames if pure_frames is not None
                                                      else pure_inpaint.force(temp_frames, mask))
-                                    for output_frame in output_frames:
+                                    for output_index, output_frame in enumerate(output_frames):
                                         self.video_writer.write(output_frame)
+                                        self.emit_preview(
+                                            temp_frames[output_index], output_frame, mask,
+                                            force=output_index == len(output_frames) - 1)
                                     self.update_progress(tbar, increment=len(output_frames))
                                     continue
                             for batch in batch_generator(temp_frames, config.propainterMaxLoadNum.value):
                                 # 2. 调用批推理
                                 if len(batch) == 1:
                                     single_mask = create_mask(self.mask_size, sub_list[start_frame_no])
+                                    single_mask = self.enrich_solid_background_mask(batch[0], single_mask)
                                     inpainted_frame = self.lama_inpaint.inpaint(batch[0], single_mask)
                                     self.video_writer.write(inpainted_frame)
+                                    self.emit_preview(batch[0], inpainted_frame, single_mask,
+                                                      force=True)
                                     # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
                                     inner_index += 1
                                     self.update_progress(tbar, increment=1)
@@ -284,11 +317,8 @@ class SubtitleRemover:
                                         self.video_writer.write(inpainted_frame)
                                         # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[index]}')
                                         inner_index += 1
-                                        preview_mask = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
-                                        preview_frame = np.clip(
-                                            batch[i].astype(np.float32) + preview_mask * 80.0,
-                                            0, 255).astype(np.uint8)
-                                        self.update_preview_with_comp(preview_frame, inpainted_frame)
+                                        self.emit_preview(batch[i], inpainted_frame, mask,
+                                                          force=i == len(batch) - 1)
                                 self.update_progress(tbar, increment=len(batch))
 
     def sttn_auto_mode(self, tbar):
@@ -319,6 +349,10 @@ class SubtitleRemover:
         tbar.write(f"Subtitle timeline expand ({config.subtitleTimelineBackwardFrameCount.value} <- -> {config.subtitleTimelineForwardFrameCount.value}): {continuous_frame_no_list}")
         continuous_frame_no_list = sub_detector.filter_and_merge_intervals(continuous_frame_no_list, config.sttnReferenceLength.value)
         tbar.write(f'Subtitle filter_and_merge_intervals: {continuous_frame_no_list}')
+        scene_div_points = sub_detector.get_scene_div_frame_no(self.video_path)
+        continuous_frame_no_list = sub_detector.split_range_by_scene(
+            continuous_frame_no_list, scene_div_points)
+        tbar.write(f'Subtitle split by scene: {continuous_frame_no_list}')
         del sub_detector
         gc.collect()
         start_end_map = dict()
@@ -340,7 +374,7 @@ class SubtitleRemover:
                 self.video_writer.write(frame)
                 # self.append_output(f'write frame: {current_frame_index}')
                 self.update_progress(tbar, increment=1)
-                self.update_preview_with_comp(frame, frame)
+                self.emit_preview(frame, frame)
             # 如果是区间开始，则找到尾巴
             else:
                 start_frame_index = current_frame_index
@@ -370,6 +404,7 @@ class SubtitleRemover:
                                 mask_area_coordinates.append(area)
                 # 1. 获取当前批次使用的mask
                 mask = create_mask(self.mask_size, mask_area_coordinates)
+                mask = self.enrich_solid_background_mask(frames_need_inpaint[0], mask)
                 self.append_output(tr['Main']['InpaintMaskStats'].format(
                     int(np.count_nonzero(mask)), mask.shape[1], mask.shape[0]))
                 if not np.any(mask):
@@ -388,8 +423,11 @@ class SubtitleRemover:
                     pure_frames = pure_inpaint(frames_need_inpaint, mask)
                     if pure_frames is not None or pure_mode == "force":
                         output_frames = pure_frames if pure_frames is not None else pure_inpaint.force(frames_need_inpaint, mask)
-                        for output_frame in output_frames:
+                        for output_index, output_frame in enumerate(output_frames):
                             self.video_writer.write(output_frame)
+                            self.emit_preview(
+                                frames_need_inpaint[output_index], output_frame, mask,
+                                force=output_index == len(output_frames) - 1)
                         self.update_progress(tbar, increment=len(output_frames))
                         continue
                 # self.append_output(f'inpaint with mask: {mask_area_coordinates}')
@@ -402,11 +440,8 @@ class SubtitleRemover:
                             self.video_writer.write(inpainted_frame)
                             # self.append_output(f'write frame: {start_frame_index + inner_index} with mask')
                             inner_index += 1
-                            preview_mask = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
-                            preview_frame = np.clip(
-                                batch[i].astype(np.float32) + preview_mask * 80.0,
-                                0, 255).astype(np.uint8)
-                            self.update_preview_with_comp(preview_frame, inpainted_frame)
+                            self.emit_preview(batch[i], inpainted_frame, mask,
+                                              force=i == len(batch) - 1)
                     self.update_progress(tbar, increment=len(batch))
         reader.stop()
 
@@ -439,15 +474,12 @@ class SubtitleRemover:
             gc.collect()
             if len(sub_list):
                 mask = create_mask(original_frame.shape[0:2], sub_list)
+                mask = self.enrich_solid_background_mask(original_frame, mask)
                 inpainted_frame = self.lama_inpaint.inpaint(original_frame, mask)
-                preview_mask = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
-                preview_frame = np.clip(
-                    original_frame.astype(np.float32) + preview_mask * 80.0,
-                    0, 255).astype(np.uint8)
-                self.update_preview_with_comp(preview_frame, inpainted_frame)
+                self.emit_preview(original_frame, inpainted_frame, mask, force=True)
             else:
                 inpainted_frame = original_frame
-                self.update_preview_with_comp(original_frame, inpainted_frame)
+                self.emit_preview(original_frame, inpainted_frame, force=True)
             cv2.imencode(self.ext, inpainted_frame)[1].tofile(self.video_out_path)
             tbar.update(1)
             self.progress_total = 100
