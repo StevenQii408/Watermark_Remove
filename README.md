@@ -2,9 +2,6 @@
 
 [简体中文](README.md) | [English](README_en.md)
 
-<div align="center">
-  <img src="design/icon_1024.PNG" alt="Watermark Remove" width="128" height="128">
-</div>
 
 > 面向桌面端的视频硬字幕与文字水印处理工具。
 
