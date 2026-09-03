@@ -54,10 +54,47 @@ class SubtitleDetect:
         )
 
     def detect_subtitle(self, img):
+        temp_list = self._detect_once(img)
+        small_trigger = (not temp_list or min((ymax - ymin for _, _, ymin, ymax in temp_list), default=999) <=
+                         config.smallSubtitlePixelThreshold.value)
+        if config.smallSubtitleEnhance.value and config.qualityProfile.value != "speed" and small_trigger:
+            height, width = img.shape[:2]
+            regions = self.sub_areas or [(0, height, 0, width)]
+            for ymin, ymax, xmin, xmax in regions:
+                x1, x2 = max(0, int(xmin)), min(width, int(xmax))
+                y1, y2 = max(0, int(ymin)), min(height, int(ymax))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                crop = img[y1:y2, x1:x2]
+                scale = max(2, min(4, int(config.smallSubtitleScale.value)))
+                enlarged = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+                enhanced = cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR)
+                blur = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+                sharpened = cv2.addWeighted(enhanced, 1.35, blur, -0.35, 0)
+                tile_size = config.smallSubtitleTileSize.value * scale
+                overlap = min(config.smallSubtitleTileOverlap.value * scale, tile_size // 2)
+                step = max(1, tile_size - overlap)
+                variants = (enlarged, sharpened) if config.qualityProfile.value == "quality" else (enlarged,)
+                for variant in variants:
+                    for offset_x in range(0, variant.shape[1], step):
+                        tile = variant[:, offset_x:min(variant.shape[1], offset_x + tile_size)]
+                        if tile.size == 0:
+                            continue
+                        for box in self._detect_once(tile):
+                            temp_list.append(((box[0] + offset_x) // scale + x1,
+                                              (box[1] + offset_x) // scale + x1,
+                                              box[2] // scale + y1, box[3] // scale + y1))
+                        if offset_x + tile_size >= variant.shape[1]:
+                            break
+        temp_list = self._filter_and_merge(temp_list, img.shape[1], img.shape[0])
+        return self._filter_to_sub_areas(temp_list)
+
+    def _detect_once(self, img):
         temp_list = []
         results = self.text_detector.predict(img)
         sub_areas = self.sub_areas
-        has_areas = sub_areas is not None and len(sub_areas) > 0
         for res in results:
             dt_polys = res['dt_polys']
             if dt_polys is None or len(dt_polys) == 0:
@@ -65,21 +102,52 @@ class SubtitleDetect:
             coordinate_list = get_coordinates(dt_polys.tolist())
             if not coordinate_list:
                 continue
-            if not has_areas:
-                temp_list.extend(coordinate_list)
-            elif len(sub_areas) == 1:
-                # 单区域快速路径（最常见场景）
-                s_ymin, s_ymax, s_xmin, s_xmax = sub_areas[0]
-                for xmin, xmax, ymin, ymax in coordinate_list:
-                    if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
-                        temp_list.append((xmin, xmax, ymin, ymax))
-            else:
-                for xmin, xmax, ymin, ymax in coordinate_list:
-                    for s_ymin, s_ymax, s_xmin, s_xmax in sub_areas:
-                        if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
-                            temp_list.append((xmin, xmax, ymin, ymax))
-                            break
+            temp_list.extend(coordinate_list)
         return temp_list
+
+    def _filter_to_sub_areas(self, boxes):
+        if not self.sub_areas:
+            return boxes
+        filtered = []
+        for original_box in boxes:
+            xmin, xmax, ymin, ymax = original_box
+            for s_ymin, s_ymax, s_xmin, s_xmax in self.sub_areas:
+                inter_w = max(0, min(xmax, s_xmax) - max(xmin, s_xmin))
+                inter_h = max(0, min(ymax, s_ymax) - max(ymin, s_ymin))
+                if inter_w * inter_h >= 0.25 * max(1, (xmax - xmin) * (ymax - ymin)):
+                    filtered.append(original_box)
+                    break
+        return filtered
+
+    @staticmethod
+    def _filter_and_merge(boxes, width, height):
+        valid = []
+        for original_box in boxes:
+            xmin, xmax, ymin, ymax = original_box
+            xmin, xmax = max(0, int(xmin)), min(width - 1, int(xmax))
+            ymin, ymax = max(0, int(ymin)), min(height - 1, int(ymax))
+            if xmax > xmin and ymax > ymin:
+                normalized_box = (xmin, xmax, ymin, ymax)
+                valid.append(original_box if normalized_box == tuple(original_box) else normalized_box)
+        valid.sort(key=lambda box: (box[2], box[0]))
+        merged = []
+        for box in valid:
+            bx1, bx2, by1, by2 = box
+            merged_into = False
+            for index, current in enumerate(merged):
+                cx1, cx2, cy1, cy2 = current
+                inter = max(0, min(bx2, cx2) - max(bx1, cx1)) * max(0, min(by2, cy2) - max(by1, cy1))
+                union = (bx2 - bx1) * (by2 - by1) + (cx2 - cx1) * (cy2 - cy1) - inter
+                close = abs(((by1 + by2) - (cy1 + cy2)) / 2) <= config.subtitleAreaYAxisDifferencePixel.value
+                overlap = union > 0 and inter / union >= 0.25
+                adjacent = close and bx1 <= cx2 + max(3, (by2 - by1) // 2)
+                if overlap or adjacent:
+                    merged[index] = (min(bx1, cx1), max(bx2, cx2), min(by1, cy1), max(by2, cy2))
+                    merged_into = True
+                    break
+            if not merged_into:
+                merged.append(box)
+        return merged
 
     def find_subtitle_frame_no(self, sub_remover=None):
         video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
@@ -97,7 +165,8 @@ class SubtitleDetect:
                 break
             # 读取视频帧成功
             current_frame_no += 1
-            if not is_frame_number_in_ab_sections(current_frame_no - 1, sub_remover.ab_sections):
+            ab_sections = sub_remover.ab_sections if sub_remover else None
+            if not is_frame_number_in_ab_sections(current_frame_no - 1, ab_sections):
                 tbar.update(1)
                 continue
             # 仅对采样帧执行 OCR 推理
@@ -109,16 +178,25 @@ class SubtitleDetect:
             if sub_remover:
                 sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
         video_cap.release()
-        # 阶段2：插值填充 — 两个采样帧之间都有字幕时，中间帧也标记为有字幕
+        # 阶段2：按 IoU/中心距离匹配轨迹，并插值填充采样间的漏检帧
         subtitle_frame_no_box_dict = {}
         detected_nos = sorted(sampled_results.keys())
         max_gap = self.SAMPLE_STEP * 2
         for f, next_f in zip(detected_nos, detected_nos[1:]):
             subtitle_frame_no_box_dict[f] = sampled_results[f]
             if next_f - f <= max_gap:
-                fill_mask = sampled_results[f]
                 for fill_f in range(f + 1, next_f):
-                    subtitle_frame_no_box_dict[fill_f] = fill_mask
+                    ratio = (fill_f - f) / (next_f - f)
+                    current = sampled_results[f]
+                    following = sampled_results[next_f]
+                    interpolated = []
+                    for box in current:
+                        match = min(following, key=lambda other: self._box_distance(box, other), default=None)
+                        if match is None or self._box_iou(box, match) < 0.05:
+                            interpolated.append(box)
+                            continue
+                        interpolated.append(tuple(int(a + (b - a) * ratio) for a, b in zip(box, match)))
+                    subtitle_frame_no_box_dict[fill_f] = interpolated
         # 添加最后一个检测帧
         if detected_nos:
             subtitle_frame_no_box_dict[detected_nos[-1]] = sampled_results[detected_nos[-1]]
@@ -130,6 +208,19 @@ class SubtitleDetect:
             if len(subtitle_frame_no_box_dict[key]) > 0:
                 new_subtitle_frame_no_box_dict[key] = subtitle_frame_no_box_dict[key]
         return new_subtitle_frame_no_box_dict
+
+    @staticmethod
+    def _box_iou(first, second):
+        x1 = max(first[0], second[0]); x2 = min(first[1], second[1])
+        y1 = max(first[2], second[2]); y2 = min(first[3], second[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = max(1, (first[1] - first[0]) * (first[3] - first[2]))
+        area_b = max(1, (second[1] - second[0]) * (second[3] - second[2]))
+        return inter / max(1, area_a + area_b - inter)
+
+    @staticmethod
+    def _box_distance(first, second):
+        return abs((first[0] + first[1]) - (second[0] + second[1])) + abs((first[2] + first[3]) - (second[2] + second[3]))
 
     @staticmethod
     def split_range_by_scene(intervals, points):
@@ -194,12 +285,19 @@ class SubtitleDetect:
                 # 新增一个列表来存放匹配过的标准区间
                 new_unify_values = []
 
-                for idx, region in enumerate(current_regions):
-                    last_standard_region = unify_value_map[last_key][idx] if idx < len(unify_value_map[last_key]) else None
+                previous_regions = unify_value_map[last_key]
+                unmatched_regions = list(previous_regions)
+                for region in current_regions:
+                    last_standard_region = min(
+                        unmatched_regions,
+                        key=lambda previous: self._box_distance(region, previous),
+                        default=None)
 
                     # 如果当前的区间与前一个键的对应区间相似，我们统一它们
-                    if last_standard_region and self.are_similar(region, last_standard_region):
+                    if last_standard_region and (self.are_similar(region, last_standard_region) or
+                                                 self._box_iou(region, last_standard_region) >= 0.25):
                         new_unify_values.append(last_standard_region)
+                        unmatched_regions.remove(last_standard_region)
                     else:
                         new_unify_values.append(region)
 

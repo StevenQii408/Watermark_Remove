@@ -16,7 +16,7 @@ from backend.inpaint.video.model.recurrent_flow_completion import RecurrentFlowC
 from backend.inpaint.video.model.propainter import InpaintGenerator
 from backend.inpaint.video.core.utils import to_tensors
 from backend.inpaint.video.model.misc import get_device
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+from backend.tools.inpaint_tools import alpha_blend, get_local_inpaint_areas, normalize_mask
 
 import warnings
 
@@ -40,7 +40,7 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
         elif mpath.ndim == 3 and mpath.shape[2] == 3:
             # 如果是彩色图像，转为灰度
             mpath = cv2.cvtColor(mpath, cv2.COLOR_BGR2GRAY)
-        masks_img = [Image.fromarray(mpath)]
+        masks_img = [Image.fromarray((normalize_mask(mpath) * 255).astype(np.uint8))]
     # input single img path
     else:
         if isinstance(mpath, str):
@@ -53,6 +53,7 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
 
     for mask_img in masks_img:
         mask_img = np.array(mask_img.convert('L'))
+        mask_img = (mask_img > 127).astype(np.uint8)
 
         # Dilate 8 pixel so that all known pixel is trustworthy
         if flow_mask_dilates > 0:
@@ -139,6 +140,7 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
 class PropainterInpaint:
     def __init__(self, device, model_dir, sub_video_length=80, use_fp16=True):
         self.device = device
+        self.last_fallback_reason = None
         self.model_dir = model_dir
         self.use_fp16 = use_fp16
         self.use_half = True if self.use_fp16 else False
@@ -188,6 +190,7 @@ class PropainterInpaint:
         return model
 
     def inpaint(self, frames, mask):
+        self.last_fallback_reason = None
         if isinstance(frames[0], np.ndarray):
             frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames]
         size = frames[0].size
@@ -348,7 +351,14 @@ class PropainterInpaint:
                     0, 2, 3, 1).numpy().astype(np.uint8)
                 for i in range(len(neighbor_ids)):
                     idx = neighbor_ids[i]
-                    img = np.array(pred_img[i]).astype(np.uint8) * binary_masks[i] \
+                    generated_rgb = np.asarray(pred_img[i], dtype=np.float32)
+                    if (not np.isfinite(generated_rgb).all() or
+                            float(generated_rgb.min()) < -1.0 or
+                            float(generated_rgb.max()) > 256.0):
+                        self.last_fallback_reason = "ProPainter output outside [0, 255]"
+                        generated_rgb = np.asarray(frames_inp[idx], dtype=np.float32)
+                    generated = np.clip(generated_rgb, 0, 255).astype(np.uint8)
+                    img = generated * binary_masks[i] \
                           + ori_frames[idx] * (1 - binary_masks[i])
                     if comp_frames[idx] is None:
                         comp_frames[idx] = img
@@ -357,7 +367,12 @@ class PropainterInpaint:
                     comp_frames[idx] = comp_frames[idx].astype(np.uint8)
             torch.cuda.empty_cache()
         # save videos frame
-        comp_frames = [cv2.cvtColor(i, cv2.COLOR_RGB2BGR) for i in comp_frames]
+        comp_frames = [cv2.cvtColor(i, cv2.COLOR_RGB2BGR) if i is not None
+                       else cv2.cvtColor(frames_inp[index], cv2.COLOR_RGB2BGR)
+                       for index, i in enumerate(comp_frames)]
+        comp_frames = [np.clip(frame, 0, 255).astype(np.uint8) if np.isfinite(frame).all()
+                       else cv2.cvtColor(frames_inp[index], cv2.COLOR_RGB2BGR)
+                       for index, frame in enumerate(comp_frames)]
         return comp_frames
 
     def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
@@ -365,13 +380,12 @@ class PropainterInpaint:
         :param input_frames: 原视频帧
         :param input_mask: 字幕区域mask
         """
-        mask = input_mask[:, :, None]
+        mask = normalize_mask(input_mask)
         H_ori, W_ori = mask.shape[:2]
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
         # 确定去字幕的垂直高度部分
-        split_h = int(W_ori * 3 / 16)
-        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask, multiple=8)
+        inpaint_area = get_local_inpaint_areas(mask, context_x=0.6, context_y=2.0, multiple=8)
         # 初始化帧存储变量
         # 高分辨率帧存储列表
         frames_hr = [f.copy() for f in input_frames]
@@ -389,8 +403,20 @@ class PropainterInpaint:
             image = frames_hr[j]
             # 对每个去除部分进行切割和缩放
             for k in range(len(inpaint_area)):
-                image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]  # 切割
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]  # 切割
+                y1, y2, x1, x2 = inpaint_area[k]
+                image_crop = image[y1:y2, x1:x2, :]
+                mask_crop = mask[y1:y2, x1:x2]
+                # ProPainter's encoder expects spatial dimensions divisible by 8.
+                # Pad only the model input; the result is cropped before compositing.
+                pad_bottom = (-image_crop.shape[0]) % 8
+                pad_right = (-image_crop.shape[1]) % 8
+                if pad_bottom or pad_right:
+                    image_crop = cv2.copyMakeBorder(
+                        image_crop, 0, pad_bottom, 0, pad_right,
+                        cv2.BORDER_REFLECT_101)
+                    mask_crop = cv2.copyMakeBorder(
+                        mask_crop, 0, pad_bottom, 0, pad_right,
+                        cv2.BORDER_CONSTANT, value=0)
                 frames_scaled[k].append(image_crop)  # 将缩放后的帧添加到对应列表
                 masks_scaled[k].append(mask_crop)  # 将缩放后的遮罩添加到对应列表
 
@@ -398,6 +424,9 @@ class PropainterInpaint:
         for k in range(len(inpaint_area)):
             # 调用inpaint函数进行处理
             comps[k] = self.inpaint(frames_scaled[k], masks_scaled[k][0])
+            y1, y2, x1, x2 = inpaint_area[k]
+            crop_height, crop_width = y2 - y1, x2 - x1
+            comps[k] = [comp[:crop_height, :crop_width] for comp in comps[k]]
             del frames_scaled[k], masks_scaled[k]
             gc.collect()
 
@@ -407,9 +436,10 @@ class PropainterInpaint:
                 frame = frames_hr[j]  # 取出原始帧
                 # 对于模式中的每一个段落
                 for k in range(len(inpaint_area)):
-                    comp = comps[k][j]  # 获取补全后的帧
-                    # 实现遮罩区域内的图像融合
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :] = comp
+                    y1, y2, x1, x2 = inpaint_area[k]
+                    comp = comps[k][j]
+                    frame[y1:y2, x1:x2, :] = alpha_blend(
+                        frame[y1:y2, x1:x2, :], comp, mask[y1:y2, x1:x2])
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
                 # print(f'processing frame, {len(frames_hr) - j} left')

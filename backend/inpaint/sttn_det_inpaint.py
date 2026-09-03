@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from backend.config import config
 from backend.inpaint.sttn.network_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+from backend.tools.inpaint_tools import alpha_blend, get_local_inpaint_areas, normalize_mask
 
 # 定义图像预处理方式
 _to_tensors = transforms.Compose([
@@ -23,6 +23,7 @@ _to_tensors = transforms.Compose([
 class STTNDetInpaint:
     def __init__(self, device, model_path):
         self.device = device
+        self.last_fallback_reason = None
         # 1. 创建InpaintGenerator模型实例并装载到选择的设备上
         self.model = InpaintGenerator().to(self.device)
         # 2. 载入预训练模型的权重，转载模型的状态字典
@@ -40,16 +41,11 @@ class STTNDetInpaint:
         :param input_frames: 原视频帧
         :param mask: 字幕区域mask
         """
-        mask = input_mask[:, :, None]
+        mask = normalize_mask(input_mask)
         H_ori, W_ori = mask.shape[:2]
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
-        # 确定去字幕的垂直高度部分
-        if H_ori > W_ori:
-            split_h = int(H_ori * 5 / 9)
-        else:
-            split_h = int(W_ori * 5 / 18)
-        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask)
+        inpaint_area = get_local_inpaint_areas(mask, context_x=0.45, context_y=1.5)
         # 初始化帧存储变量
         # 高分辨率帧存储列表（浅拷贝 + 逐帧 copy，避免 deepcopy 开销）
         frames_hr = [f.copy() for f in input_frames]
@@ -67,10 +63,10 @@ class STTNDetInpaint:
             image = frames_hr[j]
             # 对每个去除部分进行切割和缩放
             for k in range(len(inpaint_area)):
-                image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]  # 切割
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], :, :]  # 切割
+                image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]
+                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3]]
                 image_resize = cv2.resize(image_crop, (self.model_input_width, self.model_input_height))  # 缩放
-                mask_resize = cv2.resize(mask_crop, (self.model_input_width, self.model_input_height))  # 缩放
+                mask_resize = (cv2.resize(mask_crop, (self.model_input_width, self.model_input_height)) * 255).astype(np.uint8)
                 frames_scaled[k].append(image_resize)  # 将缩放后的帧添加到对应列表
                 masks_scaled[k].append(mask_resize)  # 将缩放后的遮罩添加到对应列表
 
@@ -85,12 +81,11 @@ class STTNDetInpaint:
                 frame = frames_hr[j]  # 取出原始帧
                 # 对于模式中的每一个段落
                 for k in range(len(inpaint_area)):
-                    comp = cv2.resize(comps[k][j], (W_ori, split_h))  # 将补全帧缩放回原大小
-                    comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)  # 转换颜色空间
-                    # 获取遮罩区域并进行图像合成
-                    mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]  # 取出遮罩区域
-                    # 实现遮罩区域内的图像融合
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = comp
+                    y1, y2, x1, x2 = inpaint_area[k]
+                    comp = cv2.resize(comps[k][j], (x2 - x1, y2 - y1))
+                    frame[y1:y2, x1:x2, :] = alpha_blend(
+                        frame[y1:y2, x1:x2, :], comp,
+                        mask[y1:y2, x1:x2])
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
                 # print(f'processing frame, {len(frames_hr) - j} left')
@@ -126,12 +121,15 @@ class STTNDetInpaint:
         使用STTN完成空洞填充（空洞即被遮罩的区域）
         """
         frame_length = len(frames)
+        self.last_fallback_reason = None
         # 对帧进行预处理转换为张量，并进行归一化
-        feats = _to_tensors(frames).unsqueeze(0) * 2 - 1
+        model_frames = frames
+        feats = _to_tensors(model_frames).unsqueeze(0) * 2 - 1
 
-        binary_masks = [np.expand_dims((np.array(m) > 0.5).astype(np.uint8), 2) for m in masks]
+        binary_masks = [np.expand_dims((normalize_mask(m) > 0.5).astype(np.float32), 2) for m in masks]
         # 将掩码转换为张量
-        masks_tensor = (_to_tensors(masks).unsqueeze(0) > 0.5).float()
+        mask_images = [(normalize_mask(m) * 255).astype(np.uint8) for m in masks]
+        masks_tensor = (_to_tensors(mask_images).unsqueeze(0) > 0.5).float()
 
         # 把特征张量转移到指定的设备（CPU或GPU）
         feats, masks_tensor = feats.to(self.device), masks_tensor.to(self.device)
@@ -165,10 +163,20 @@ class STTNDetInpaint:
                 for i in range(len(neighbor_ids)):
                     idx = neighbor_ids[i]
                     # 将预测的图片转换为无符号8位整数格式
-                    img = pred_img[i].astype(np.uint8) * binary_masks[idx] + frames[idx] * (1 - binary_masks[idx])
+                    generated_rgb = np.asarray(pred_img[i], dtype=np.float32)
+                    if (not np.isfinite(generated_rgb).all() or
+                            float(generated_rgb.min()) < -1.0 or
+                            float(generated_rgb.max()) > 256.0):
+                        self.last_fallback_reason = "STTN output outside [0, 255]"
+                        generated = np.asarray(model_frames[idx], dtype=np.float32)
+                    else:
+                        generated = cv2.cvtColor(
+                            np.clip(generated_rgb, 0, 255).astype(np.uint8),
+                            cv2.COLOR_RGB2BGR).astype(np.float32)
+                    img = generated * binary_masks[idx] + np.asarray(model_frames[idx], dtype=np.float32) * (1 - binary_masks[idx])
                     if comp_frames[idx] is None:
                         comp_frames[idx] = img
                     else:
                         comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
         # 返回处理完成的帧序列
-        return comp_frames
+        return [np.clip(frame, 0, 255).astype(np.uint8) for frame in comp_frames]

@@ -23,14 +23,9 @@ class Config(QConfig):
     # 界面语言设置
     intefaceTexts = {
         '简体中文': 'ch',
-        '繁體中文': 'chinese_cht',
         'English': 'en',
-        '한국어': 'ko',
-        '日本語': 'japan',
-        'Tiếng Việt': 'vi',
-        'Español': 'es'
     }
-    interface = OptionsConfigItem("Window", "Interface", "ChineseSimplified", OptionsValidator(intefaceTexts.values()), restart = True)
+    interface = OptionsConfigItem("Window", "Interface", "ch", OptionsValidator(intefaceTexts.values()), restart = True)
     
     # 窗口位置和大小
     windowX = ConfigItem("Window", "X", None)
@@ -50,7 +45,9 @@ class Config(QConfig):
     - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
     """
     # 【设置inpaint算法】
-    inpaintMode = OptionsConfigItem("Main", "InpaintMode", InpaintMode.STTN_AUTO, OptionsValidator(InpaintMode), EnumSerializer(InpaintMode))
+    inpaintMode = OptionsConfigItem("Main", "InpaintMode", InpaintMode.STTN_DET, OptionsValidator(InpaintMode), EnumSerializer(InpaintMode))
+    processingProfile = OptionsConfigItem("Main", "ProcessingProfile", "basic",
+                                          OptionsValidator(["basic", "enhanced"]))
     
     subtitleDetectMode =  OptionsConfigItem("Main", "SubtitleDetectMode", SubtitleDetectMode.PP_OCRv5_SERVER, OptionsValidator(SubtitleDetectMode), EnumSerializer(SubtitleDetectMode))
 
@@ -66,6 +63,17 @@ class Config(QConfig):
     subtitleAreaPixelToleranceXPixel = RangeConfigItem("Main", "SubtitleAreaPixelToleranceXPixel", 20, RangeValidator(0, 300))
     subtitleTimelineBackwardFrameCount = RangeConfigItem("Main", "SubtitleTimelineBackwardFrameCount", 3, RangeValidator(0, 300))
     subtitleTimelineForwardFrameCount = RangeConfigItem("Main", "subtitleTimelineForwardFrameCount", 3, RangeValidator(0, 300))
+    smallSubtitleEnhance = ConfigItem("Main", "SmallSubtitleEnhance", True, BoolValidator())
+    smallSubtitleScale = RangeConfigItem("Main", "SmallSubtitleScale", 2, RangeValidator(2, 4))
+    smallSubtitlePixelThreshold = RangeConfigItem("Main", "SmallSubtitlePixelThreshold", 22, RangeValidator(4, 100))
+    smallSubtitleTileSize = RangeConfigItem("Main", "SmallSubtitleTileSize", 960, RangeValidator(256, 4096))
+    smallSubtitleTileOverlap = RangeConfigItem("Main", "SmallSubtitleTileOverlap", 96, RangeValidator(0, 512))
+    pureBackgroundMode = OptionsConfigItem("Main", "PureBackgroundMode", "auto",
+                                           OptionsValidator(["off", "auto", "force"]))
+    pureBackgroundVarianceThreshold = RangeConfigItem("Main", "PureBackgroundVarianceThreshold", 180, RangeValidator(10, 1000))
+    pureBackgroundTemporalWindow = RangeConfigItem("Main", "PureBackgroundTemporalWindow", 5, RangeValidator(1, 20))
+    qualityProfile = OptionsConfigItem("Main", "QualityProfile", "balanced",
+                                       OptionsValidator(["quality", "balanced", "speed"]))
     # 以下参数仅适用STTN算法时，才生效
     """
     1. STTN_SKIP_DETECTION
@@ -118,6 +126,13 @@ if isinstance(_detect_mode_value, str) and _detect_mode_value in ("快速", "Fas
     config.set(config.subtitleDetectMode, SubtitleDetectMode.PP_OCRv5_MOBILE)
 elif isinstance(_detect_mode_value, str) and _detect_mode_value in ("精准", "Precise"):
     config.set(config.subtitleDetectMode, SubtitleDetectMode.PP_OCRv5_SERVER)
+
+# The desktop UI exposes only the precise detector. Migrate legacy language/model values.
+if config.interface.value not in config.interface.validator.options:
+    config.set(config.interface, 'ch')
+if config.processingProfile.value not in config.processingProfile.validator.options:
+    config.set(config.processingProfile, 'basic')
+config.set(config.subtitleDetectMode, SubtitleDetectMode.PP_OCRv5_SERVER)
 
 # 读取界面语言配置
 tr = configparser.ConfigParser()

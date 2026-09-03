@@ -6,7 +6,8 @@ from qfluentwidgets import (FluentWindow, PushButton, Slider, ProgressBar, Plain
                           FolderListSettingCard, HyperlinkCard, ColorSettingCard, 
                           CustomColorSettingCard)
 from backend.config import config, tr, HARDWARD_ACCELERATION_OPTION
-from backend.tools.constant import InpaintMode, SubtitleDetectMode
+from backend.tools.constant import InpaintMode
+from backend.tools.hardware_accelerator import HardwareAccelerator
 
 class SettingInterface(QtWidgets.QVBoxLayout):
 
@@ -14,38 +15,18 @@ class SettingInterface(QtWidgets.QVBoxLayout):
         super().__init__()
         self.setContentsMargins(16, 16, 16, 16)
         
-        # 界面语言设置
-        self.interface_combo = ComboBoxSettingCard(
-            configItem=config.interface,
-            icon=FluentIcon.LANGUAGE,
-            title=tr["SubtitleExtractorGUI"]["InterfaceLanguage"],
-            content="",
-            parent=parent,
-            texts=config.intefaceTexts.keys(),
-        )
-        self.addWidget(self.interface_combo)
-        
         # 处理模式设置
-        self.inpaint_mode_combo = ComboBoxSettingCard(
-            configItem=config.inpaintMode,
+        self.processing_profile_combo = ComboBoxSettingCard(
+            configItem=config.processingProfile,
             icon=FluentIcon.GLOBE,
-            title=tr["SubtitleExtractorGUI"]["InpaintMode"],
-            content="",
+            title=tr["SubtitleExtractorGUI"]["ProcessingProfile"],
+            content=tr["SubtitleExtractorGUI"]["ProcessingProfileDesc"],
             parent=parent,
-            texts=[list(tr['InpaintMode'].values())[i] for i,_ in enumerate(config.inpaintMode.validator.options)],
+            texts=[tr["ModelProfile"]["Basic"], tr["ModelProfile"]["Enhanced"]],
         )
-        self.inpaint_mode_combo.setToolTip(tr["SubtitleExtractorGUI"]["InpaintModeDesc"])
-        self.addWidget(self.inpaint_mode_combo)
-
-        self.subtitle_detect_model_combo = ComboBoxSettingCard(
-            configItem=config.subtitleDetectMode,
-            icon=FluentIcon.SEARCH,
-            title=tr["SubtitleExtractorGUI"]["SubtitleDetectMode"],
-            content="",
-            parent=parent,
-            texts=[list(tr['SubtitleDetectMode'].values())[i] for i,_ in enumerate(config.subtitleDetectMode.validator.options)],
-        )
-        self.addWidget(self.subtitle_detect_model_combo)
+        self.processing_profile_combo.setToolTip(tr["SubtitleExtractorGUI"]["ProcessingProfileDesc"])
+        self.addWidget(self.processing_profile_combo)
+        self.processing_profile_combo.comboBox.currentIndexChanged.connect(self._sync_processing_mode)
 
         # 是否启用硬件加速
         self.hardware_acceleration = SwitchSettingCard(
@@ -56,18 +37,23 @@ class SettingInterface(QtWidgets.QVBoxLayout):
             parent=parent
         )
         self.addWidget(self.hardware_acceleration)
-        # 如果硬件加速选项被禁用, 设置硬件加速为False并只读
-        if not HARDWARD_ACCELERATION_OPTION:
+        hardware_available = (HARDWARD_ACCELERATION_OPTION and
+                              HardwareAccelerator.instance().has_accelerator())
+        if not hardware_available:
             self.hardware_acceleration.switchButton.setChecked(False)
             self.hardware_acceleration.switchButton.setEnabled(False)
             self.hardware_acceleration.setContent(tr["Setting"]["HardwareAccelerationNO"])
-            config.set(config.hardwareAcceleration, False)
+        self._sync_processing_mode()
         # 添加一些空间
         self.addStretch(1)
     
     def set_inpaint_mode_enabled(self, enabled):
         """启用或禁用 inpaint 模式下拉框"""
-        self.inpaint_mode_combo.comboBox.setEnabled(enabled)
+        self.processing_profile_combo.comboBox.setEnabled(enabled)
+
+    def _sync_processing_mode(self, index=None):
+        mode = InpaintMode.PROPAINTER if config.processingProfile.value == 'enhanced' else InpaintMode.STTN_DET
+        config.set(config.inpaintMode, mode)
 
     def reset_setting(self):
         """重置所有设置为默认值"""

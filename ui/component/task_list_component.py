@@ -83,8 +83,10 @@ class TaskListComponent(QWidget):
         
         # 创建表格
         self.table = TableWidget(self)
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels([tr['TaskList']['Name'], tr['TaskList']['Progress'], tr['TaskList']['Status']])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels([
+            tr['TaskList']['Name'], tr['TaskList']['Model'],
+            tr['TaskList']['Progress'], tr['TaskList']['Status']])
         
         # 设置表格样式
         self.table.setShowGrid(False)
@@ -93,8 +95,9 @@ class TaskListComponent(QWidget):
         # 设置列宽模式
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)           # 名称列拉伸填充
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # 进度列自适应内容宽度
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # 状态列自适应内容宽度
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -137,8 +140,10 @@ class TaskListComponent(QWidget):
         self.table.setRowCount(len(self.tasks))
         
         item0 = QTableWidgetItem(file_name)
-        item1 = QTableWidgetItem("0%")
-        item2 = QTableWidgetItem(TaskStatus.PENDING.value)
+        profile_text = tr['ModelProfile']['Enhanced'] if config.processingProfile.value == 'enhanced' else tr['ModelProfile']['Basic']
+        item1 = QTableWidgetItem(profile_text)
+        item2 = QTableWidgetItem("0%")
+        item3 = QTableWidgetItem(TaskStatus.PENDING.value)
         
         # 设置文件名单元格的省略模式为中间省略
         item0.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
@@ -148,10 +153,12 @@ class TaskListComponent(QWidget):
         
         item1.setTextAlignment(Qt.AlignCenter)
         item2.setTextAlignment(Qt.AlignCenter)
+        item3.setTextAlignment(Qt.AlignCenter)
         
         self.table.setItem(row, 0, item0)
         self.table.setItem(row, 1, item1)
         self.table.setItem(row, 2, item2)
+        self.table.setItem(row, 3, item3)
         
         # 滚动到最新添加的行
         self.table.scrollToBottom()
@@ -168,13 +175,21 @@ class TaskListComponent(QWidget):
             self.tasks[index].progress = progress
             
             # 更新进度单元格
-            progress_item = self.table.item(index, 1)
+            progress_item = self.table.item(index, 2)
             if progress_item:
                 progress_item.setText(f"{progress}%")
             
             # 如果是当前处理的任务，滚动到可见区域
             if index == self.current_task_index:
                 self.table.scrollTo(self.table.model().index(index, 0))
+
+    def refresh_profile(self):
+        """Refresh the displayed model label after the global profile changes."""
+        profile_text = tr['ModelProfile']['Enhanced'] if config.processingProfile.value == 'enhanced' else tr['ModelProfile']['Basic']
+        for index in range(len(self.tasks)):
+            item = self.table.item(index, 1)
+            if item:
+                item.setText(profile_text)
                 
     def update_task_status(self, index, status):
         """更新任务状态
@@ -185,7 +200,7 @@ class TaskListComponent(QWidget):
         """
         if 0 <= index < len(self.tasks):
             self.tasks[index].status = status
-            status_item = self.table.item(index, 2)
+            status_item = self.table.item(index, 3)
             if status_item:
                 status_item.setText(status.value)
                 

@@ -31,6 +31,10 @@ from ui.home_interface import HomeInterface
 class SubtitleExtractorGUI(FluentWindow): 
     def __init__(self):
         super().__init__()
+        setTheme(Theme.AUTO)
+        setThemeColor(QtGui.QColor("#2DD4BF"), save=False)
+        self.setMinimumSize(1100, 700)
+        self.resize(1440, 900)
         # 禁用云母效果
         self.setMicaEffectEnabled(False)
         # 设置深色主题并跟随系统主题色
@@ -44,6 +48,17 @@ class SubtitleExtractorGUI(FluentWindow):
         # 设置窗口图标
         self.setWindowIcon(QtGui.QIcon("design/vsr.ico"))
         self.setWindowTitle(tr['SubtitleExtractorGUI']['Title'] + " v" + VERSION)
+        self.setStyleSheet("""
+            #workspaceHeader { padding: 2px 0 8px 0; }
+            #workspaceSubtitle, #settingsIntro, #selectionHint { color: #8395a7; }
+            #runtimeStatus { color: #2dd4bf; }
+            #hardwareStatus { color: #9aabba; }
+            #sectionLabel { color: #9aabba; font-size: 12px; font-weight: 600; letter-spacing: 1px; }
+            #actionBar { border: 1px solid rgba(148, 163, 184, 0.16); border-radius: 12px; }
+            #videoContainer { border: 1px solid rgba(148, 163, 184, 0.14); border-radius: 14px; }
+            #TaskListComponent QTableWidget { border: 0; background: transparent; }
+            #TaskListComponent QHeaderView::section { border: 0; padding: 8px; color: #8395a7; }
+        """)
         # 创建界面布局
         self._create_layout()
         self._connectSignalToSlot()
@@ -79,7 +94,7 @@ class SubtitleExtractorGUI(FluentWindow):
         
         # 添加到主窗口作为子界面
         self.addSubInterface(self.homeInterface,FluentIcon.HOME, tr['SubtitleExtractorGUI']['Title'])
-        self.addSubInterface(self.advancedSettingInterface, FluentIcon.SETTING, tr['Setting']['AdvancedSetting'], NavigationItemPosition.BOTTOM)
+        self.addSubInterface(self.advancedSettingInterface, FluentIcon.SETTING, tr['SubtitleExtractorGUI']['Setting'], NavigationItemPosition.BOTTOM)
 
     def on_navigation_item_changed(self, key):
         """导航项变更时的处理函数"""

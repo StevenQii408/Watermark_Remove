@@ -4,17 +4,19 @@ import threading
 import multiprocessing
 import time
 import traceback
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QFrame, QLabel
 from PySide6.QtCore import Slot, QRect, Signal
 from PySide6 import QtWidgets
 from datetime import datetime
-from qfluentwidgets import (PushButton, CardWidget, TextEdit, FluentIcon)
+from qfluentwidgets import (PushButton, PrimaryPushButton, CardWidget, TextEdit, FluentIcon,
+                            SubtitleLabel, BodyLabel, StrongBodyLabel, ComboBox)
 from ui.setting_interface import SettingInterface
 from ui.component.video_display_component import VideoDisplayComponent
 from ui.component.task_list_component import TaskListComponent, TaskStatus, TaskOptions
 from ui.icon.my_fluent_icon import MyFluentIcon
 from backend.config import config, tr
 from backend.tools.constant import InpaintMode
+from backend.tools.hardware_accelerator import HardwareAccelerator
 from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
 from backend.tools.common_tools import get_readable_path, is_image_file, read_image
@@ -67,9 +69,42 @@ class HomeInterface(QWidget):
 
     def __init_widgets(self):
         """创建主页面"""
-        main_layout = QHBoxLayout(self)
-        main_layout.setSpacing(8)
-        main_layout.setContentsMargins(16, 16, 16, 16)
+        page_layout = QVBoxLayout(self)
+        page_layout.setSpacing(14)
+        page_layout.setContentsMargins(20, 18, 20, 20)
+
+        header = QFrame(self)
+        header.setObjectName("workspaceHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(2, 0, 2, 0)
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(2)
+        self.workspace_title = SubtitleLabel(tr['SubtitleExtractorGUI']['Title'], header)
+        self.workspace_subtitle = BodyLabel(tr['SubtitleExtractorGUI']['WorkspaceSubtitle'], header)
+        self.workspace_subtitle.setObjectName("workspaceSubtitle")
+        title_layout.addWidget(self.workspace_title)
+        title_layout.addWidget(self.workspace_subtitle)
+        header_layout.addLayout(title_layout)
+        header_layout.addStretch(1)
+        self.language_combo = ComboBox(header)
+        self.language_combo.addItems(list(config.intefaceTexts.keys()))
+        self.language_combo.setCurrentIndex(0 if config.interface.value == 'ch' else 1)
+        self.language_combo.setFixedWidth(108)
+        self.language_combo.setToolTip(tr['SubtitleExtractorGUI']['InterfaceLanguage'])
+        self.language_combo.currentIndexChanged.connect(self._language_changed)
+        header_layout.addWidget(self.language_combo)
+        header_layout.addSpacing(16)
+        self.runtime_status = StrongBodyLabel(tr['SubtitleExtractorGUI']['Ready'], header)
+        self.runtime_status.setObjectName("runtimeStatus")
+        self.hardware_status = BodyLabel(self._hardware_status_text(), header)
+        self.hardware_status.setObjectName("hardwareStatus")
+        header_layout.addWidget(self.runtime_status)
+        header_layout.addSpacing(16)
+        header_layout.addWidget(self.hardware_status)
+        page_layout.addWidget(header)
+
+        workspace_layout = QHBoxLayout()
+        workspace_layout.setSpacing(16)
 
         # 左侧视频区域
         left_layout = QVBoxLayout()
@@ -79,7 +114,13 @@ class HomeInterface(QWidget):
         self.video_display_component = VideoDisplayComponent(self)
         self.video_display_component.ab_sections_changed.connect(self.ab_sections_changed)
         self.video_display_component.selections_changed.connect(self.selections_changed)
-        left_layout.addWidget(self.video_display_component)
+        preview_heading = BodyLabel(tr['SubtitleExtractorGUI']['Preview'], self)
+        preview_heading.setObjectName("sectionLabel")
+        left_layout.addWidget(preview_heading)
+        left_layout.addWidget(self.video_display_component, 1)
+        self.selection_hint = BodyLabel(tr['SubtitleExtractorGUI']['SelectionHint'], self)
+        self.selection_hint.setObjectName("selectionHint")
+        left_layout.addWidget(self.selection_hint)
         
         # 获取视频显示和滑块的引用
         self.video_display = self.video_display_component.video_display
@@ -88,20 +129,22 @@ class HomeInterface(QWidget):
         
         # 输出文本区域
         self.output_text = TextEdit()
-        self.output_text.setMinimumHeight(150)
+        self.output_text.setMinimumHeight(72)
+        self.output_text.setMaximumHeight(112)
         self.output_text.setReadOnly(True)
         self.output_text.document().setDocumentMargin(10)        
         # 连接滚动条值变化信号
         self.output_text.verticalScrollBar().valueChanged.connect(self.on_scroll_change)
         
         output_container = CardWidget(self)
+        output_container.setFixedHeight(100)
         output_layout = QVBoxLayout()
         output_layout.setContentsMargins(0, 0, 0, 0)
         output_layout.addWidget(self.output_text)
         output_container.setLayout(output_layout)
-        left_layout.addWidget(output_container)
+        left_layout.addWidget(output_container, 0)
 
-        main_layout.addLayout(left_layout, 2)
+        workspace_layout.addLayout(left_layout, 2)
 
         # 右侧设置区域
         right_layout = QVBoxLayout()
@@ -111,7 +154,11 @@ class HomeInterface(QWidget):
         settings_container = CardWidget(self)
         self.setting_interface = SettingInterface(settings_container)
         settings_container.setLayout(self.setting_interface)
-        right_layout.addWidget(settings_container)
+        self.setting_interface.processing_profile_combo.comboBox.currentIndexChanged.connect(
+            lambda _index: self.task_list_component.refresh_profile() if hasattr(self, 'task_list_component') else None)
+        self.setting_interface.hardware_acceleration.switchButton.checkedChanged.connect(
+            lambda _checked: self.hardware_status.setText(self._hardware_status_text()))
+        right_layout.addWidget(settings_container, 0)
         
         # 添加任务列表容器
         task_list_container = CardWidget(self)
@@ -123,35 +170,46 @@ class HomeInterface(QWidget):
         self.task_list_component.task_deleted.connect(self.on_task_deleted)
         task_list_layout.addWidget(self.task_list_component)
         task_list_container.setLayout(task_list_layout)
-        right_layout.addWidget(task_list_container, 1)  # 占满剩余空间
-        
-        # 操作按钮容器
-        button_container = CardWidget(self)
-        button_layout = QHBoxLayout()
-        button_layout.setContentsMargins(16, 16, 16, 16)
-        button_layout.setSpacing(8)
-        
-        self.file_button = PushButton(tr['SubtitleExtractorGUI']['Open'], self)
+        right_layout.addWidget(task_list_container, 1)
+
+        action_container = QFrame(self)
+        action_container.setObjectName("actionBar")
+        action_layout = QVBoxLayout(action_container)
+        action_layout.setContentsMargins(10, 10, 10, 10)
+        action_layout.setSpacing(8)
+
+        self.file_button = PushButton(tr['SubtitleExtractorGUI']['Open'], action_container)
         self.file_button.setIcon(FluentIcon.FOLDER)
         self.file_button.clicked.connect(self.open_file)
-        button_layout.addWidget(self.file_button)
-        
-        self.run_button = PushButton(tr['SubtitleExtractorGUI']['Run'], self)
+        action_layout.addWidget(self.file_button)
+
+        self.run_button = PrimaryPushButton(tr['SubtitleExtractorGUI']['Run'], action_container)
         self.run_button.setIcon(FluentIcon.PLAY)
         self.run_button.clicked.connect(self.run_button_clicked)
-        button_layout.addWidget(self.run_button)
-        
-        self.stop_button = PushButton(tr['SubtitleExtractorGUI']['Stop'], self)
+        action_layout.addWidget(self.run_button)
+
+        self.stop_button = PushButton(tr['SubtitleExtractorGUI']['Stop'], action_container)
         self.stop_button.setIcon(MyFluentIcon.Stop)
         self.stop_button.setVisible(False)
         self.stop_button.clicked.connect(self.stop_button_clicked)
+        action_layout.addWidget(self.stop_button)
+        right_layout.addWidget(action_container, 0)
         
-        button_layout.addWidget(self.stop_button)
-        
-        button_container.setLayout(button_layout)
-        right_layout.addWidget(button_container)
+        workspace_layout.addLayout(right_layout, 1)
+        page_layout.addLayout(workspace_layout, 1)
 
-        main_layout.addLayout(right_layout, 1)
+        self.setting_interface._sync_processing_mode()
+
+    def _hardware_status_text(self):
+        accelerator = HardwareAccelerator.instance()
+        if not config.hardwareAcceleration.value or not accelerator.has_accelerator():
+            return tr['SubtitleExtractorGUI']['HardwareDisabled'].format(tr['SubtitleExtractorGUI']['CPU'])
+        return tr['SubtitleExtractorGUI']['HardwareEnabled'].format(accelerator.accelerator_name)
+
+    def _language_changed(self, index):
+        language = 'ch' if index == 0 else 'en'
+        if config.interface.value != language:
+            config.set(config.interface, language)
     
     def on_scroll_change(self, value):
         """监控滚动条位置变化"""
@@ -302,12 +360,15 @@ class HomeInterface(QWidget):
             self.running_process = None
             self.run_button.setVisible(True)
             self.stop_button.setVisible(False)
+            self.runtime_status.setText(tr['SubtitleExtractorGUI']['Ready'])
 
     @Slot(bool)
     def _toggle_buttons(self, show_run):
         """线程安全地切换按钮可见性"""
         self.run_button.setVisible(show_run)
         self.stop_button.setVisible(not show_run)
+        if show_run and self.current_processing_task_index < 0:
+            self.runtime_status.setText(tr['SubtitleExtractorGUI']['Ready'])
 
     def run_button_clicked(self):
         if not self.task_list_component.get_pending_tasks():
@@ -315,6 +376,8 @@ class HomeInterface(QWidget):
             return
 
         try:
+            self.setting_interface._sync_processing_mode()
+            self.runtime_status.setText(tr['SubtitleExtractorGUI']['Processing'])
             # 获取所有待执行的任务
             pending_tasks = self.task_list_component.get_pending_tasks()
             if not pending_tasks:
@@ -364,6 +427,7 @@ class HomeInterface(QWidget):
                                 if key == TaskOptions.SUB_AREAS.value:
                                     value = self.video_display_component.preview_coordinates_to_video_coordinates(value)
                                 options[key] = value
+                            options['inpaint_mode'] = config.inpaintMode.value
                             # 清理缓存, 使用动态路径
                             task_item.output_path = None
                             output_path = task_item.output_path
@@ -421,7 +485,11 @@ class HomeInterface(QWidget):
             from backend.main import SubtitleRemover
             sr = SubtitleRemover(video_path, True)
             sr.video_out_path = output_path
+            if 'inpaint_mode' in options:
+                config.set(config.inpaintMode, options['inpaint_mode'])
             for key in options:
+                if key == 'inpaint_mode':
+                    continue
                 setattr(sr, key, options[key])
             sr.add_progress_listener(lambda progress, isFinished: SubtitleRemoverRemoteCall.remote_call_update_progress(queue, progress, isFinished))
             sr.append_output = lambda *args: SubtitleRemoverRemoteCall.remote_call_append_log(queue, args)
@@ -478,6 +546,7 @@ class HomeInterface(QWidget):
         # 处理完成后恢复界面可用性
         self.run_button.setVisible(True)
         self.stop_button.setVisible(False)
+        self.runtime_status.setText(tr['SubtitleExtractorGUI']['Ready'])
         self.se = None
         # 重置视频滑块
         self.video_slider.setValue(1)
@@ -487,6 +556,12 @@ class HomeInterface(QWidget):
     @Slot(int, bool)
     def update_progress(self, progress_total, isFinished):
         try:
+            if not isFinished:
+                current_task = (self.task_list_component.get_task(self.current_processing_task_index)
+                                if self.current_processing_task_index >= 0 else None)
+                task_name = f" · {current_task.name}" if current_task else ""
+                self.runtime_status.setText(
+                    f"{tr['SubtitleExtractorGUI']['Processing']}{task_name} · {int(progress_total)}%")
             pos = min(self.frame_count - 1, int(progress_total / 100 * self.frame_count))
             if pos != self.video_slider.value():
                 self.video_slider.blockSignals(True)
@@ -561,11 +636,13 @@ class HomeInterface(QWidget):
     @Slot(object)
     def on_task_error(self, e):
         self.append_output(tr['SubtitleExtractorGUI']['ErrorDuringProcessing'].format(str(e)))
+        self.runtime_status.setText(tr['SubtitleExtractorGUI']['Failed'])
         if self.current_processing_task_index >= 0:
             self.task_list_component.update_task_status(self.current_processing_task_index, TaskStatus.FAILED)
 
     def load_video(self, video_path):
         self.video_path = video_path
+        self.runtime_status.setText(tr['SubtitleExtractorGUI']['Loading'])
         with self._video_cap_lock:
             if self.video_cap:
                 self.video_cap.release()
@@ -589,6 +666,7 @@ class HomeInterface(QWidget):
             self.fps = self.video_cap.get(cv2.CAP_PROP_FPS)
 
         self.update_preview(frame)
+        self.runtime_status.setText(tr['SubtitleExtractorGUI']['Ready'])
         self.video_slider.setMaximum(self.frame_count)
         self.video_slider.setValue(1)
         self.video_display_component.set_dragger_enabled(True)
@@ -609,6 +687,7 @@ class HomeInterface(QWidget):
         self.frame_width = frame.shape[1]
         self.fps = 1
         self.update_preview(frame)
+        self.runtime_status.setText(tr['SubtitleExtractorGUI']['Ready'])
         self.video_slider.setMaximum(self.frame_count)
         self.video_slider.setValue(1)
         self.video_display_component.set_dragger_enabled(True)
@@ -685,4 +764,3 @@ class HomeInterface(QWidget):
         except Exception as e:
             print(f"Error during close window:", e)
         super().closeEvent(event)
-    

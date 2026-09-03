@@ -1,5 +1,5 @@
 import cv2
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QMenu
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QMenu, QSizePolicy
 from PySide6.QtCore import Qt, Signal, QRect, QRectF, QObject, QEvent
 from PySide6.QtGui import QAction, QShortcut, QCursor
 from PySide6 import QtCore, QtWidgets, QtGui 
@@ -17,6 +17,7 @@ class VideoDisplayComponent(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent = parent
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         
         # 初始化变量
         self.is_drawing = False
@@ -96,11 +97,14 @@ class VideoDisplayComponent(QWidget):
             border-top-right-radius: 10px;
             border: 0px solid transparent;
         """)
-        self.video_display.setMinimumSize(self.video_preview_width, self.video_preview_height)
+        self.video_display.setMinimumSize(0, 0)
+        self.video_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
         self.video_display.setMouseTracking(True)
         self.video_display.setScaledContents(True)
         self.video_display.setAlignment(Qt.AlignCenter)
+        self.video_display.setText(tr['SubtitleExtractorGUI']['SelectMediaHint'])
+        self.video_display.setObjectName('videoDisplay')
         self.video_display.mousePressEvent = self.selection_mouse_press
         self.video_display.mouseMoveEvent = self.selection_mouse_move
         self.video_display.mouseReleaseEvent = self.selection_mouse_release
@@ -128,21 +132,27 @@ class VideoDisplayComponent(QWidget):
         ratio_layout.addWidget(self.video_display)
 
         # 设置固定的宽高比
-        ratio_container.setFixedHeight(ratio_container.width() * 9 // 16)
-        ratio_container.setMinimumWidth(self.video_preview_width)
+        ratio_container.setMinimumSize(320, 180)
+        ratio_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         # 添加到布局
-        black_layout.addWidget(ratio_container)
+        black_layout.addWidget(ratio_container, 0, Qt.AlignCenter)
 
         # 添加一个事件过滤器来处理大小变化
         class RatioEventFilter(QObject):
             def eventFilter(self, obj, event):
                 if event.type() == QEvent.Resize:
-                    obj.setFixedHeight(obj.width() * 9 // 16)
+                    container = ratio_container.parentWidget()
+                    target_width = max(320, container.width() - 4)
+                    target_height = int(target_width * 9 / 16)
+                    if target_width != ratio_container.width():
+                        ratio_container.setFixedWidth(target_width)
+                    if target_height != ratio_container.height():
+                        ratio_container.setFixedHeight(target_height)
                 return False
 
         ratio_filter = RatioEventFilter(ratio_container)
-        ratio_container.installEventFilter(ratio_filter)
+        self.black_container.installEventFilter(ratio_filter)
 
         # 进度条和滑块容器
         control_container = QWidget(self)
@@ -282,12 +292,11 @@ class VideoDisplayComponent(QWidget):
             for i, rect in enumerate(self.selection_rects):
                 # 设置选择框样式
                 if i == self.active_selection_index:
-                    # 活动选区使用绿色
-                    pen = QtGui.QPen(QtGui.QColor(0, 255, 0))
+                    pen = QtGui.QPen(QtGui.QColor("#2DD4BF"))
+                    pen.setWidth(3)
                 else:
-                    # 非活动选区使用黄色
-                    pen = QtGui.QPen(QtGui.QColor(255, 255, 0))
-                pen.setWidth(2)
+                    pen = QtGui.QPen(QtGui.QColor(45, 212, 191, 150))
+                    pen.setWidth(2)
                 painter.setPen(pen)
                 
                 # 将比例坐标转换为像素坐标
@@ -301,10 +310,13 @@ class VideoDisplayComponent(QWidget):
                 
                 # 绘制选择框
                 painter.drawRect(pixel_rect)
+                label = tr['SubtitleExtractorGUI']['SelectionLabel'].format(i + 1)
+                painter.setPen(QtGui.QPen(QtGui.QColor("#E6FFFB")))
+                painter.drawText(pixel_rect.topLeft() + QtCore.QPoint(4, -5), label)
             
             # 如果正在绘制新选区，也绘制它
             if self.is_drawing and any(self.selection_rect):
-                pen = QtGui.QPen(QtGui.QColor(0, 255, 0))  # 绿色
+                pen = QtGui.QPen(QtGui.QColor("#2DD4BF"))
                 pen.setWidth(2)
                 painter.setPen(pen)
                 

@@ -4,6 +4,113 @@ import numpy as np
 
 from backend.config import config
 
+
+def normalize_mask(mask, shape=None):
+    """Return a clipped single-channel float mask in the range [0, 1]."""
+    array = np.asarray(mask)
+    if array.ndim == 3:
+        if array.shape[2] == 1:
+            array = array[:, :, 0]
+        else:
+            array = cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+    array = array.astype(np.float32, copy=False)
+    if array.size and float(array.max()) > 1.0:
+        array = array / 255.0
+    array = np.clip(array, 0.0, 1.0)
+    if shape is not None and array.shape != tuple(shape):
+        array = cv2.resize(array, (int(shape[1]), int(shape[0])), interpolation=cv2.INTER_NEAREST)
+    return array
+
+
+def alpha_blend(original, generated, mask):
+    """Blend generated pixels only where the normalized mask is active."""
+    source = np.asarray(original)
+    replacement = np.asarray(generated)
+    alpha = normalize_mask(mask, source.shape[:2])[:, :, None]
+    if replacement.ndim == 2:
+        replacement = cv2.cvtColor(replacement, cv2.COLOR_GRAY2BGR)
+    if replacement.shape != source.shape:
+        replacement = cv2.resize(replacement, (source.shape[1], source.shape[0]), interpolation=cv2.INTER_LINEAR)
+    if not np.isfinite(replacement).all():
+        return source.copy()
+    result = replacement.astype(np.float32) * alpha + source.astype(np.float32) * (1.0 - alpha)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def get_local_inpaint_areas(mask, context_x=0.35, context_y=1.0, multiple=1):
+    """Build bounded local crop areas around connected mask components."""
+    binary = (normalize_mask(mask) > 0.5).astype(np.uint8)
+    if not np.any(binary):
+        return []
+    height, width = binary.shape[:2]
+    count, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    areas = []
+    for index in range(1, count):
+        x, y, box_width, box_height, area = stats[index]
+        if area < 10:
+            continue
+        pad_x = max(12, int(box_width * context_x))
+        pad_y = max(12, int(box_height * context_y))
+        x1 = max(0, int(x - pad_x))
+        y1 = max(0, int(y - pad_y))
+        x2 = min(width, int(x + box_width + pad_x))
+        y2 = min(height, int(y + box_height + pad_y))
+        if multiple > 1:
+            crop_width = x2 - x1
+            crop_height = y2 - y1
+            width_remainder = crop_width % multiple
+            height_remainder = crop_height % multiple
+            x2 = min(width, x2 + (multiple - width_remainder) % multiple)
+            y2 = min(height, y2 + (multiple - height_remainder) % multiple)
+            if x2 - x1 < multiple:
+                x1 = max(0, x2 - multiple)
+            if y2 - y1 < multiple:
+                y1 = max(0, y2 - multiple)
+        areas.append((y1, y2, x1, x2))
+    areas.sort()
+    merged = []
+    for area in areas:
+        y1, y2, x1, x2 = area
+        merged_index = None
+        for index, current in enumerate(merged):
+            cy1, cy2, cx1, cx2 = current
+            intersects = min(x2, cx2) > max(x1, cx1) and min(y2, cy2) > max(y1, cy1)
+            if intersects or (x1 <= cx2 and cx1 <= x2 and y1 <= cy2 and cy1 <= y2):
+                merged_index = index
+                merged[index] = (min(y1, cy1), max(y2, cy2), min(x1, cx1), max(x2, cx2))
+                break
+        if merged_index is None:
+            merged.append(area)
+    if multiple <= 1:
+        return merged
+
+    def align_area(area):
+        y1, y2, x1, x2 = area
+        crop_height = y2 - y1
+        crop_width = x2 - x1
+        target_height = ((crop_height + multiple - 1) // multiple) * multiple
+        target_width = ((crop_width + multiple - 1) // multiple) * multiple
+        target_height = min(target_height, height)
+        target_width = min(target_width, width)
+        if target_height < multiple:
+            target_height = min(height, multiple)
+        if target_width < multiple:
+            target_width = min(width, multiple)
+
+        extra_height = max(0, target_height - crop_height)
+        extra_width = max(0, target_width - crop_width)
+        top = min(extra_height // 2, y1)
+        left = min(extra_width // 2, x1)
+        y1 -= top
+        x1 -= left
+        y2 = min(height, y1 + target_height)
+        x2 = min(width, x1 + target_width)
+        y1 = max(0, y2 - target_height)
+        x1 = max(0, x2 - target_width)
+        return (y1, y2, x1, x2)
+
+    return [align_area(area) for area in merged]
+
 def batch_generator(data, max_batch_size):
     """
     根据data大小，生成最大长度不超过max_batch_size的均匀批次数据
@@ -32,18 +139,31 @@ def create_mask(size, coords_list):
     mask = np.zeros(size, dtype="uint8")
     if coords_list:
         for coords in coords_list:
-            xmin, xmax, ymin, ymax = coords
-            # 为了避免框过小，放大10个像素
-            x1 = xmin - config.subtitleAreaDeviationPixel.value
-            if x1 < 0:
-                x1 = 0
-            y1 = ymin - config.subtitleAreaDeviationPixel.value
-            if y1 < 0:
-                y1 = 0
-            x2 = xmax + config.subtitleAreaDeviationPixel.value
-            y2 = ymax + config.subtitleAreaDeviationPixel.value
-            cv2.rectangle(mask, (x1, y1),
-                          (x2, y2), (255, 255, 255), thickness=-1)
+            if len(coords) == 4:
+                xmin, xmax, ymin, ymax = coords
+                polygon = getattr(coords, "polygon", None)
+                box_height = max(1, ymax - ymin)
+                horizontal_pad = max(2, min(config.subtitleAreaDeviationPixel.value, box_height // 2))
+                vertical_pad = max(3, config.subtitleAreaDeviationPixel.value)
+                x1 = max(0, int(xmin - horizontal_pad))
+                y1 = max(0, int(ymin - vertical_pad))
+                x2 = min(size[1] - 1, int(xmax + horizontal_pad))
+                y2 = min(size[0] - 1, int(ymax + vertical_pad))
+                if polygon:
+                    points = np.asarray(polygon, dtype=np.int32)
+                    cv2.fillPoly(mask, [points], 255)
+                    kernel = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE,
+                        (2 * horizontal_pad + 1, 2 * vertical_pad + 1))
+                    mask = cv2.dilate(mask, kernel)
+                else:
+                    cv2.rectangle(mask, (x1, y1), (x2, y2), 255, thickness=-1)
+            elif len(coords) == 8:
+                points = np.asarray(coords, dtype=np.int32).reshape(-1, 2)
+                cv2.fillPoly(mask, [points], 255)
+    if np.any(mask):
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     return mask
 
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):

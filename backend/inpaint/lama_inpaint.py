@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 from backend.inpaint.utils.lama_util import prepare_img_and_mask, get_image, pad_img_to_modulo
 from backend import config
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+from backend.tools.inpaint_tools import alpha_blend, get_inpaint_area_by_mask, normalize_mask
 
 class LamaInpaint:
     def __init__(self, device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), model_path='big-lama.pt') -> None:
@@ -70,7 +70,7 @@ class LamaInpaint:
         :param input_frames: 原视频帧
         :param input_mask: 字幕区域mask
         """
-        mask = input_mask[:, :, None]
+        mask = normalize_mask(input_mask)
         H_ori, W_ori = mask.shape[:2]
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
@@ -89,7 +89,7 @@ class LamaInpaint:
             cropped_masks = []
             for j in range(len(frames_hr)):
                 image_crop = frames_hr[j][inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], :, :]
+                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], :]
                 cropped_frames.append(image_crop)
                 cropped_masks.append(mask_crop)
 
@@ -103,7 +103,9 @@ class LamaInpaint:
             for j in range(len(frames_hr)):
                 frame = frames_hr[j]
                 for k in range(len(inpaint_area)):
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = comps[k][j]
+                    ymin, ymax, xmin, xmax = inpaint_area[k]
+                    frame[ymin:ymax, :, :] = alpha_blend(
+                        frame[ymin:ymax, :, :], comps[k][j], mask[ymin:ymax, :])
                 inpainted_frames.append(frame)
         else:
             # 无需处理的区域，返回原始帧
