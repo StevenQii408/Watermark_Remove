@@ -55,6 +55,81 @@ def alpha_blend(original, generated, mask):
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+def feather_mask(mask, radius=1):
+    """Return a small soft alpha transition around a binary mask."""
+    normalized = normalize_mask(mask)
+    if radius <= 0 or not np.any(normalized):
+        return normalized
+    kernel_size = max(3, int(radius) * 2 + 1)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    return np.clip(
+        cv2.GaussianBlur(normalized, (kernel_size, kernel_size), 0.6), 0.0, 1.0)
+
+
+def create_subtitle_masks(size, coords_list, context_pixels=3, prefer_polygon=False):
+    """Create a tight compositing mask and a slightly wider model mask.
+
+    The tight mask limits the pixels that can be changed in the output. The
+    model mask provides a small amount of context around thin glyphs without
+    turning the whole subtitle band into a hole.
+    """
+    height, width = int(size[0]), int(size[1])
+    blend_mask = np.zeros((height, width), dtype=np.uint8)
+    if coords_list:
+        for coords in coords_list:
+            values = tuple(coords)
+            if len(values) == 4:
+                xmin, xmax, ymin, ymax = [int(round(value)) for value in values]
+                box_height = max(1, ymax - ymin)
+                horizontal_pad = max(1, min(4, int(round(box_height * 0.08))))
+                vertical_pad = max(1, min(5, int(round(box_height * 0.12))))
+                x1 = max(0, xmin - horizontal_pad)
+                y1 = max(0, ymin - vertical_pad)
+                x2 = min(width - 1, xmax + horizontal_pad)
+                y2 = min(height - 1, ymax + vertical_pad)
+                polygon = getattr(coords, "polygon", None) if prefer_polygon else None
+                if polygon is not None and len(polygon) == 4:
+                    points = np.asarray(polygon, dtype=np.int32)
+                    polygon_mask = np.zeros_like(blend_mask)
+                    cv2.fillPoly(polygon_mask, [points], 255)
+                    kernel = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE,
+                        (2 * horizontal_pad + 1, 2 * vertical_pad + 1))
+                    blend_mask |= cv2.dilate(polygon_mask, kernel)
+                elif x2 > x1 and y2 > y1:
+                    cv2.rectangle(blend_mask, (x1, y1), (x2, y2), 255, thickness=-1)
+            elif len(values) == 8:
+                points = np.asarray(values, dtype=np.int32).reshape(-1, 2)
+                cv2.fillPoly(blend_mask, [points], 255)
+    if not np.any(blend_mask):
+        return blend_mask, blend_mask.copy()
+    blend_mask = cv2.morphologyEx(
+        blend_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    context = max(1, min(4, int(context_pixels)))
+    model_mask = cv2.dilate(
+        blend_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * context + 1, 2 * context + 1)),
+    )
+    return blend_mask, model_mask
+
+
+def mask_edge_density(frame, mask, dilation=5):
+    """Measure texture around a mask, used to avoid false solid-panel expansion."""
+    image = ensure_bgr_uint8(frame)
+    binary = (normalize_mask(mask, image.shape[:2]) > 0.5).astype(np.uint8)
+    if not np.any(binary):
+        return 0.0
+    ring = cv2.dilate(binary, np.ones((2 * dilation + 1, 2 * dilation + 1), np.uint8))
+    ring = (ring > 0) & (binary == 0)
+    pixels = int(ring.sum())
+    if pixels == 0:
+        return 0.0
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 150)
+    return float(np.count_nonzero(edges[ring])) / pixels
+
+
 def expand_solid_background_mask(frame, mask, max_area_ratio=8.0):
     """Include a locally uniform subtitle panel around OCR text when reliable."""
     image = ensure_bgr_uint8(frame)
@@ -75,6 +150,11 @@ def expand_solid_background_mask(frame, mask, max_area_ratio=8.0):
         x2, y2 = min(width, x + box_width + pad_x), min(height, y + box_height + pad_y)
         roi_mask = binary[y1:y2, x1:x2]
         roi_lab = lab_image[y1:y2, x1:x2]
+        roi_gray = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        roi_edges = cv2.Canny(roi_gray, 60, 150)
+        roi_edge_density = float(np.count_nonzero(roi_edges)) / max(1, roi_edges.size)
+        if roi_edge_density > 0.12:
+            continue
         ring = cv2.dilate(roi_mask, np.ones((5, 5), np.uint8)) - roi_mask
         ring_pixels = roi_lab[ring > 0]
         if len(ring_pixels) < 20:

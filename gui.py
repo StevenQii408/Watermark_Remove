@@ -3,7 +3,7 @@
 @Author  : Fang Yao（原作者） / 改写：Jason Eric
 @Time    : 2023/4/1 6:07 下午（原始时间）
 @FileName: gui.py
-@desc: 字幕去除器图形化界面（由 PySimpleGUI 改写为 PySide6）
+@desc: 视频水印擦除图形化界面（由 PySimpleGUI 改写为 PySide6）
 """
 
 import sys
@@ -24,8 +24,9 @@ from qframelesswindow.utils import getSystemAccentColor
 from backend.config import config, tr, VERSION
 from backend.tools.theme_listener import SystemThemeListener
 from backend.tools.process_manager import ProcessManager
-from ui.advanced_setting_interface import AdvancedSettingInterface
 from ui.home_interface import HomeInterface
+from backend.tools.version_service import VersionService
+from backend.tools.concurrent import TaskExecutor
 
 
 class SubtitleExtractorGUI(FluentWindow): 
@@ -45,9 +46,7 @@ class SubtitleExtractorGUI(FluentWindow):
         # self.themeListener = SystemThemeListener(self)
         # self.themeListener.start()
  
-        # 设置窗口图标
-        self.setWindowIcon(QtGui.QIcon("design/vsr.ico"))
-        self.setWindowTitle(tr['SubtitleExtractorGUI']['Title'] + " v" + VERSION)
+        self.setWindowTitle(tr['SubtitleExtractorGUI']['Title'])
         self.setStyleSheet("""
             #workspaceHeader { padding: 2px 0 8px 0; }
             #workspaceSubtitle, #settingsIntro, #selectionHint { color: #8395a7; }
@@ -70,8 +69,21 @@ class SubtitleExtractorGUI(FluentWindow):
             return
         self.check_update_timer = QtCore.QTimer(self)
         self.check_update_timer.setSingleShot(True)
-        self.check_update_timer.timeout.connect(lambda: self.advancedSettingInterface.check_update(ignore=True))
+        self.check_update_timer.timeout.connect(self._check_update_silently)
         self.check_update_timer.start(2000)
+
+    def _check_update_silently(self):
+        version_manager = VersionService()
+        TaskExecutor.runTask(version_manager.has_new_version).then(
+            lambda has_update: self._show_update_hint(version_manager, has_update))
+
+    def _show_update_hint(self, version_manager, has_update):
+        if has_update:
+            InfoBar.info(
+                tr['Setting']['UpdatesAvailableTitle'],
+                tr['Setting']['UpdatesAvailableDesc'].format(version_manager.lastest_version),
+                duration=8000,
+                parent=self)
 
     def _connectSignalToSlot(self):
         config.appRestartSig.connect(self._showRestartTooltip)
@@ -86,22 +98,11 @@ class SubtitleExtractorGUI(FluentWindow):
         )
 
     def _create_layout(self):
-        # 创建主页面和高级设置页面
+        # 仅保留工作台页面
         self.homeInterface = HomeInterface(self)
         self.homeInterface.setObjectName("HomeInterface")
-        self.advancedSettingInterface = AdvancedSettingInterface(self)
-        self.advancedSettingInterface.setObjectName("AdvancedSettingInterface")
-        
-        # 添加到主窗口作为子界面
-        self.addSubInterface(self.homeInterface,FluentIcon.HOME, tr['SubtitleExtractorGUI']['Title'])
-        self.addSubInterface(self.advancedSettingInterface, FluentIcon.SETTING, tr['SubtitleExtractorGUI']['Setting'], NavigationItemPosition.BOTTOM)
-
-    def on_navigation_item_changed(self, key):
-        """导航项变更时的处理函数"""
-        if key == 'main':
-            self.stackWidget.setCurrentIndex(0)
-        elif key == 'advanced':
-            self.stackWidget.setCurrentIndex(1)
+        self.addSubInterface(self.homeInterface, FluentIcon.HOME,
+                             tr['SubtitleExtractorGUI']['Title'])
 
     def closeEvent(self, event):
         """程序关闭时保存窗口位置并清理资源"""

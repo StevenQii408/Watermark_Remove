@@ -22,7 +22,8 @@ class SettingInterface(QtWidgets.QVBoxLayout):
             title=tr["SubtitleExtractorGUI"]["ProcessingProfile"],
             content=tr["SubtitleExtractorGUI"]["ProcessingProfileDesc"],
             parent=parent,
-            texts=[tr["ModelProfile"]["Basic"], tr["ModelProfile"]["Enhanced"]],
+            texts=[tr["ModelProfile"]["Basic"], tr["ModelProfile"]["Enhanced"],
+                   tr["ModelProfile"]["SttnFast"]],
         )
         self.processing_profile_combo.setToolTip(tr["SubtitleExtractorGUI"]["ProcessingProfileDesc"])
         self.addWidget(self.processing_profile_combo)
@@ -52,7 +53,12 @@ class SettingInterface(QtWidgets.QVBoxLayout):
         self.processing_profile_combo.comboBox.setEnabled(enabled)
 
     def _sync_processing_mode(self, index=None):
-        mode = InpaintMode.PROPAINTER if config.processingProfile.value == 'enhanced' else InpaintMode.STTN_DET
+        mode_map = {
+            'basic': InpaintMode.STTN_DET,
+            'enhanced': InpaintMode.PROPAINTER,
+            'sttn_fast': InpaintMode.STTN_AUTO,
+        }
+        mode = mode_map.get(config.processingProfile.value, InpaintMode.STTN_DET)
         config.set(config.inpaintMode, mode)
 
     def reset_setting(self):

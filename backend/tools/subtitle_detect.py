@@ -24,6 +24,8 @@ class SubtitleDetect:
     def __init__(self, video_path, sub_areas=[]):
         self.video_path = video_path
         self.sub_areas = sub_areas
+        self._scene_div_points = None
+        self.last_tracking_fill_count = 0
         self._init_sample_step()
 
     def _init_sample_step(self):
@@ -149,7 +151,89 @@ class SubtitleDetect:
                 merged.append(box)
         return merged
 
-    def find_subtitle_frame_no(self, sub_remover=None):
+    def _build_sttn_det_tracks(self, sampled_results, scene_points=()):
+        """Build motion-aware tracks for the basic STTN detector path."""
+        if not sampled_results:
+            return {}
+        self.last_tracking_fill_count = 0
+        detected_nos = sorted(sampled_results)
+        tracked = {}
+        previous_frame = detected_nos[0]
+        previous_boxes = list(sampled_results[previous_frame])
+        previous_state = [tuple(float(value) for value in box) for box in previous_boxes]
+        velocities = [(0.0, 0.0, 0.0, 0.0) for _ in previous_state]
+        tracked[previous_frame] = previous_boxes
+
+        for frame_no in detected_nos[1:]:
+            gap = frame_no - previous_frame
+            current_boxes = list(sampled_results[frame_no])
+            if any(previous_frame < point <= frame_no for point in scene_points):
+                tracked[frame_no] = current_boxes
+                previous_frame = frame_no
+                previous_state = [tuple(float(value) for value in box) for box in current_boxes]
+                velocities = [(0.0, 0.0, 0.0, 0.0) for _ in previous_state]
+                continue
+            matches = []
+            candidates = []
+            for previous_index, previous_box in enumerate(previous_state):
+                velocity = velocities[previous_index]
+                predicted = tuple(previous_box[index] + velocity[index] * gap for index in range(4))
+                for current_index, current_box in enumerate(current_boxes):
+                    iou = self._box_iou(predicted, current_box)
+                    first_width = max(1.0, previous_box[1] - previous_box[0])
+                    first_height = max(1.0, previous_box[3] - previous_box[2])
+                    second_width = max(1.0, current_box[1] - current_box[0])
+                    second_height = max(1.0, current_box[3] - current_box[2])
+                    center_distance = (
+                        abs((predicted[0] + predicted[1]) - (current_box[0] + current_box[1])) /
+                        max(1.0, first_width + second_width) +
+                        abs((predicted[2] + predicted[3]) - (current_box[2] + current_box[3])) /
+                        max(1.0, first_height + second_height))
+                    size_distance = abs(second_width - first_width) / first_width + abs(second_height - first_height) / first_height
+                    score = (1.0 - iou) + 0.35 * center_distance + 0.15 * size_distance
+                    if iou >= 0.05 or center_distance <= 1.25:
+                        candidates.append((score, previous_index, current_index, predicted))
+                    elif center_distance <= 2.0 and size_distance <= 1.2:
+                        candidates.append((score + 0.5, previous_index, current_index, predicted))
+            used_previous = set()
+            used_current = set()
+            for _, previous_index, current_index, predicted in sorted(candidates):
+                if previous_index in used_previous or current_index in used_current:
+                    continue
+                used_previous.add(previous_index)
+                used_current.add(current_index)
+                current_box = current_boxes[current_index]
+                measured = tuple((float(current_box[index]) - previous_state[previous_index][index]) /
+                                 max(1, gap) for index in range(4))
+                velocities[previous_index] = tuple(
+                    0.65 * velocities[previous_index][index] + 0.35 * measured[index]
+                    for index in range(4))
+                matches.append((previous_index, current_index, predicted))
+
+            if gap <= self.SAMPLE_STEP * 2:
+                for fill_frame in range(previous_frame + 1, frame_no):
+                    ratio = (fill_frame - previous_frame) / max(1, gap)
+                    interpolated = []
+                    for previous_index, current_index, predicted in matches:
+                        first = previous_state[previous_index]
+                        second = current_boxes[current_index]
+                        interpolated.append(tuple(int(round(first[index] + (second[index] - first[index]) * ratio))
+                                                 for index in range(4)))
+                    if interpolated:
+                        tracked[fill_frame] = interpolated
+                        self.last_tracking_fill_count += 1
+
+            tracked[frame_no] = current_boxes
+            next_state = [tuple(float(value) for value in box) for box in current_boxes]
+            next_velocities = [(0.0, 0.0, 0.0, 0.0) for _ in next_state]
+            for previous_index, current_index, _ in matches:
+                next_velocities[current_index] = velocities[previous_index]
+            previous_frame = frame_no
+            previous_state = next_state
+            velocities = next_velocities
+        return tracked
+
+    def find_subtitle_frame_no(self, sub_remover=None, tracking_mode="default"):
         video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
         frame_count = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
         tbar = tqdm(total=int(frame_count), unit='frame', position=0, file=sys.__stdout__, desc='Subtitle Finding')
@@ -178,6 +262,16 @@ class SubtitleDetect:
             if sub_remover:
                 sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
         video_cap.release()
+        if tracking_mode == "sttn_det":
+            subtitle_frame_no_box_dict = self._build_sttn_det_tracks(
+                sampled_results, self.get_scene_div_frame_no(self.video_path))
+            if sub_remover:
+                if self.last_tracking_fill_count:
+                    sub_remover.append_output(
+                        f'基础版：轨迹补齐短暂漏检 {self.last_tracking_fill_count} 帧')
+                sub_remover.append_output(tr['Main']['FinishedFindingSubtitles'])
+            return {key: value for key, value in subtitle_frame_no_box_dict.items() if value}
+
         # 阶段2：按 IoU/中心距离匹配轨迹，并插值填充采样间的漏检帧
         subtitle_frame_no_box_dict = {}
         detected_nos = sorted(sampled_results.keys())
@@ -245,11 +339,13 @@ class SubtitleDetect:
         # 输出结果
         return result_intervals
 
-    @staticmethod
-    def get_scene_div_frame_no(v_path):
+    def get_scene_div_frame_no(self, v_path=None):
         """
         获取发生场景切换的帧号
         """
+        if self._scene_div_points is not None:
+            return list(self._scene_div_points)
+        v_path = v_path or self.video_path
         scene_div_frame_no_list = []
         scene_list = scene_detect(v_path, ContentDetector())
         for scene in scene_list:
@@ -258,7 +354,8 @@ class SubtitleDetect:
                 pass
             else:
                 scene_div_frame_no_list.append(start.frame_num + 1)
-        return scene_div_frame_no_list
+        self._scene_div_points = scene_div_frame_no_list
+        return list(scene_div_frame_no_list)
 
     @staticmethod
     def are_similar(region1, region2):
@@ -356,23 +453,49 @@ class SubtitleDetect:
         return ranges
 
     @staticmethod
-    def filter_and_merge_intervals(intervals, target_length):
+    def clamp_frame_ranges(intervals, min_frame, max_frame, merge_overlaps=False):
+        """Clamp frame intervals to valid video bounds and drop empty ranges."""
+        normalized = []
+        for start, end in intervals:
+            start = max(min_frame, int(start))
+            end = min(max_frame, int(end))
+            if start <= end:
+                normalized.append((start, end))
+        normalized.sort()
+        if not merge_overlaps:
+            return normalized
+        merged = []
+        for start, end in normalized:
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @staticmethod
+    def filter_and_merge_intervals(intervals, target_length, min_frame=1, max_frame=None):
         """
         合并传入的字幕起始区间，确保区间大小最低为STTN_REFERENCE_LENGTH
         复杂度 O(n log n)
         """
         if not intervals:
             return []
-        intervals = sorted(intervals, key=lambda x: x[0])
+        max_frame = int(max_frame) if max_frame is not None else max(
+            int(end) for _, end in intervals)
+        intervals = SubtitleDetect.clamp_frame_ranges(
+            intervals, int(min_frame), max_frame, merge_overlaps=False)
+        if not intervals:
+            return []
+        target_length = max(1, int(target_length))
         # 一次遍历：扩展单点区间，利用排序后的相邻关系 O(n)
         expanded = []
         for i, (start, end) in enumerate(intervals):
             if start == end:  # 单点区间
-                prev_end = expanded[-1][1] if expanded else float('-inf')
+                prev_end = expanded[-1][1] if expanded else min_frame - 1
                 next_start = intervals[i + 1][0] if i + 1 < len(intervals) else float('inf')
                 half = (target_length - 1) // 2
-                new_start = max(start - half, prev_end + 1)
-                new_end = min(start + half, next_start - 1)
+                new_start = max(min_frame, start - half, prev_end + 1)
+                new_end = min(max_frame, start + half, next_start - 1)
                 if new_end < new_start:
                     new_start, new_end = start, start
                 expanded.append((new_start, new_end))
@@ -388,4 +511,5 @@ class SubtitleDetect:
                 merged[-1] = (last_start, max(last_end, end))
             else:
                 merged.append((start, end))
-        return merged
+        return SubtitleDetect.clamp_frame_ranges(
+            merged, int(min_frame), max_frame, merge_overlaps=False)

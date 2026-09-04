@@ -6,7 +6,9 @@ import numpy as np
 from PIL import Image
 from backend.inpaint.utils.lama_util import prepare_img_and_mask, get_image, pad_img_to_modulo
 from backend import config
-from backend.tools.inpaint_tools import alpha_blend, binary_mask_uint8, get_inpaint_area_by_mask, normalize_mask
+from backend.tools.inpaint_tools import (alpha_blend, binary_mask_uint8,
+                                          feather_mask, get_inpaint_area_by_mask,
+                                          normalize_mask)
 
 class LamaInpaint:
     def __init__(self, device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), model_path='big-lama.pt') -> None:
@@ -15,6 +17,8 @@ class LamaInpaint:
         self.device = device
 
     def inpaint(self, image: Union[Image.Image, np.ndarray], mask: Union[Image.Image, np.ndarray]):
+        original_image = np.asarray(image).copy()
+        original_mask = mask
         if isinstance(image, np.ndarray):
             orig_height, orig_width = image.shape[:2]
         else:
@@ -25,7 +29,7 @@ class LamaInpaint:
             cur_res = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
             cur_res = np.clip(cur_res * 255, 0, 255).astype('uint8')
             cur_res = cur_res[:orig_height, :orig_width]
-            return cur_res
+            return alpha_blend(original_image, cur_res, feather_mask(original_mask))
 
     def _inpaint_batch(self, images: List[np.ndarray], masks: List[np.ndarray]):
         """批量推理：将多帧分小批次送入 GPU，避免单次推理过大导致卡死"""

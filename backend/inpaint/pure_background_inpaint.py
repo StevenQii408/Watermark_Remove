@@ -16,16 +16,23 @@ class PureBackgroundInpaint:
         return (dilated > 0) & (mask == 0)
 
     def is_pure_background(self, frames, mask):
-        if not frames or not np.any(mask):
+        if not frames:
             return False
-        binary = (mask > 0).astype(np.uint8)
-        ring = self._ring(binary)
-        if ring.sum() < 32:
+        if isinstance(mask, (list, tuple)):
+            masks = list(mask)
+        else:
+            masks = [mask for _ in frames]
+        if not masks or not any(np.any(item) for item in masks):
             return False
         values = []
         temporal_reference = None
-        sample_frames = frames[::max(1, len(frames) // self.temporal_window)]
-        for frame in sample_frames:
+        sample_step = max(1, len(frames) // self.temporal_window)
+        for frame_index in range(0, len(frames), sample_step):
+            frame = frames[frame_index]
+            binary = (masks[min(frame_index, len(masks) - 1)] > 0).astype(np.uint8)
+            ring = self._ring(binary)
+            if ring.sum() < 32:
+                return False
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
             ring_lab = lab[ring]
             values.append(ring_lab.var(axis=0).mean())
@@ -64,10 +71,20 @@ class PureBackgroundInpaint:
         alpha = np.clip(alpha, 0, 1)[..., None]
         return np.clip(result * alpha + frame.astype(np.float32) * (1 - alpha), 0, 255).astype(np.uint8)
 
+    @staticmethod
+    def _mask_list(frames, masks):
+        if isinstance(masks, (list, tuple)):
+            if len(masks) != len(frames):
+                return [masks[min(index, len(masks) - 1)] for index in range(len(frames))]
+            return list(masks)
+        return [masks for _ in frames]
+
     def __call__(self, frames, mask):
-        if not self.is_pure_background(frames, mask):
+        masks = self._mask_list(frames, mask)
+        if not self.is_pure_background(frames, masks):
             return None
-        return [self._fill_frame(frame, mask) for frame in frames]
+        return [self._fill_frame(frame, masks[index]) for index, frame in enumerate(frames)]
 
     def force(self, frames, mask):
-        return [self._fill_frame(frame, mask) for frame in frames]
+        masks = self._mask_list(frames, mask)
+        return [self._fill_frame(frame, masks[index]) for index, frame in enumerate(frames)]

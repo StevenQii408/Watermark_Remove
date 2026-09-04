@@ -427,7 +427,17 @@ class HomeInterface(QWidget):
                                 if key == TaskOptions.SUB_AREAS.value:
                                     value = self.video_display_component.preview_coordinates_to_video_coordinates(value)
                                 options[key] = value
-                            options['inpaint_mode'] = config.inpaintMode.value
+                            profile = self.task_list_component.get_task_option(
+                                self.current_processing_task_index,
+                                TaskOptions.PROCESSING_PROFILE,
+                                config.processingProfile.value)
+                            mode_map = {
+                                'basic': InpaintMode.STTN_DET,
+                                'enhanced': InpaintMode.PROPAINTER,
+                                'sttn_fast': InpaintMode.STTN_AUTO,
+                            }
+                            options['inpaint_mode'] = mode_map.get(
+                                profile, InpaintMode.STTN_DET).value
                             # 清理缓存, 使用动态路径
                             task_item.output_path = None
                             output_path = task_item.output_path
@@ -486,7 +496,12 @@ class HomeInterface(QWidget):
             sr = SubtitleRemover(video_path, True)
             sr.video_out_path = output_path
             if 'inpaint_mode' in options:
-                config.set(config.inpaintMode, options['inpaint_mode'])
+                mode_value = options['inpaint_mode']
+                try:
+                    mode = mode_value if isinstance(mode_value, InpaintMode) else InpaintMode(mode_value)
+                except (ValueError, TypeError):
+                    mode = InpaintMode.STTN_DET
+                config.set(config.inpaintMode, mode)
             for key in options:
                 if key == 'inpaint_mode':
                     continue

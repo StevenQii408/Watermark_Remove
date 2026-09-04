@@ -44,10 +44,10 @@ class Config(QConfig):
     - InpaintMode.LAMA 算法：对于动画类视频效果好，速度一般，不可以跳过字幕检测
     - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
     """
-    # 【设置inpaint算法】
+    # 【设置inpaint算法】由 processingProfile 映射：basic=STTN_DET，enhanced=PROPAINTER，sttn_fast=STTN_AUTO
     inpaintMode = OptionsConfigItem("Main", "InpaintMode", InpaintMode.STTN_DET, OptionsValidator(InpaintMode), EnumSerializer(InpaintMode))
     processingProfile = OptionsConfigItem("Main", "ProcessingProfile", "basic",
-                                          OptionsValidator(["basic", "enhanced"]))
+                                          OptionsValidator(["basic", "enhanced", "sttn_fast"]))
     
     subtitleDetectMode =  OptionsConfigItem("Main", "SubtitleDetectMode", SubtitleDetectMode.PP_OCRv5_SERVER, OptionsValidator(SubtitleDetectMode), EnumSerializer(SubtitleDetectMode))
 

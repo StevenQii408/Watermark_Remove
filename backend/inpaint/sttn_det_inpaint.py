@@ -13,8 +13,8 @@ from backend.config import config
 from backend.inpaint.sttn.network_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
 from backend.tools.inpaint_tools import (alpha_blend, binary_mask_uint8,
-                                          ensure_bgr_uint8, get_local_inpaint_areas,
-                                          normalize_mask)
+                                          ensure_bgr_uint8, feather_mask,
+                                          get_local_inpaint_areas, normalize_mask)
 
 # 定义图像预处理方式
 _to_tensors = transforms.Compose([
@@ -37,23 +37,85 @@ class STTNDetInpaint:
         # 2. 设置相连帧数
         self.neighbor_stride = config.sttnNeighborStride.value
         self.ref_length = config.sttnReferenceLength.value
+        self.last_wide_slice_count = 0
 
-    def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
+    @staticmethod
+    def _split_wide_area(area, frame_width):
+        """Split a very wide subtitle crop into at most two overlapping tiles."""
+        y1, y2, x1, x2 = area
+        crop_width, crop_height = x2 - x1, max(1, y2 - y1)
+        if crop_width / crop_height <= 5.0 and crop_width <= frame_width * 0.45:
+            return [area]
+        overlap = max(8, int(crop_width * 0.18))
+        midpoint = x1 + crop_width // 2
+        left_end = min(x2, midpoint + overlap // 2)
+        right_start = max(x1, midpoint - overlap // 2)
+        if left_end <= x1 or right_start >= x2:
+            return [area]
+        return [(y1, y2, x1, left_end), (y1, y2, right_start, x2)]
+
+    def _letterbox(self, image, mask):
+        """Resize a crop without changing its aspect ratio for STTN."""
+        target_w, target_h = self.model_input_width, self.model_input_height
+        src_h, src_w = image.shape[:2]
+        scale = min(target_w / max(1, src_w), target_h / max(1, src_h))
+        resized_w = max(1, min(target_w, int(round(src_w * scale))))
+        resized_h = max(1, min(target_h, int(round(src_h * scale))))
+        image_interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        image_resized = cv2.resize(image, (resized_w, resized_h), interpolation=image_interp)
+        mask_resized = cv2.resize(mask, (resized_w, resized_h), interpolation=cv2.INTER_NEAREST)
+        pad_left = (target_w - resized_w) // 2
+        pad_top = (target_h - resized_h) // 2
+        pad_right = target_w - resized_w - pad_left
+        pad_bottom = target_h - resized_h - pad_top
+        border = cv2.BORDER_REFLECT_101 if min(src_h, src_w) > 1 else cv2.BORDER_REPLICATE
+        image_resized = cv2.copyMakeBorder(
+            image_resized, pad_top, pad_bottom, pad_left, pad_right, border)
+        mask_resized = cv2.copyMakeBorder(
+            binary_mask_uint8(mask_resized), pad_top, pad_bottom,
+            pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
+        return image_resized, mask_resized, (pad_left, pad_top, resized_w, resized_h)
+
+    def _unletterbox(self, image, metadata, output_size):
+        pad_left, pad_top, resized_w, resized_h = metadata
+        valid = image[pad_top:pad_top + resized_h, pad_left:pad_left + resized_w]
+        return cv2.resize(valid, output_size, interpolation=cv2.INTER_CUBIC)
+
+    def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray,
+                 blend_masks=None):
         """
         :param input_frames: 原视频帧
         :param mask: 字幕区域mask
         """
         input_frames = [ensure_bgr_uint8(frame) for frame in input_frames]
-        mask = normalize_mask(input_mask)
+        if isinstance(input_mask, (list, tuple)):
+            model_masks = [normalize_mask(mask) for mask in input_mask]
+        else:
+            shared_mask = normalize_mask(input_mask)
+            model_masks = [shared_mask for _ in input_frames]
+        if not model_masks:
+            return input_frames
+        mask = np.maximum.reduce(model_masks)
+        if blend_masks is None:
+            blend_masks = model_masks
+        elif not isinstance(blend_masks, (list, tuple)):
+            blend_masks = [blend_masks for _ in input_frames]
+        blend_masks = [normalize_mask(item, input_frames[0].shape[:2]) for item in blend_masks]
         H_ori, W_ori = mask.shape[:2]
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
-        inpaint_area = get_local_inpaint_areas(mask, context_x=0.45, context_y=1.5)
+        original_areas = get_local_inpaint_areas(mask, context_x=0.35, context_y=0.8)
+        split_areas = []
+        for area in original_areas:
+            split_areas.extend(self._split_wide_area(area, W_ori))
+        inpaint_area = split_areas
+        self.last_wide_slice_count = max(0, len(inpaint_area) - len(original_areas))
         # 初始化帧存储变量
         # 高分辨率帧存储列表（浅拷贝 + 逐帧 copy，避免 deepcopy 开销）
         frames_hr = [f.copy() for f in input_frames]
         frames_scaled = {}  # 存放缩放后帧的字典
         masks_scaled = {}  # 存放缩放后遮罩的字典
+        letterbox_metadata = {}
         comps = {}  # 存放补全后帧的字典
         # 存储最终的视频帧
         inpainted_frames = []
@@ -66,12 +128,12 @@ class STTNDetInpaint:
             image = frames_hr[j]
             # 对每个去除部分进行切割和缩放
             for k in range(len(inpaint_area)):
-                image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3]]
-                image_resize = cv2.resize(image_crop, (self.model_input_width, self.model_input_height))  # 缩放
-                mask_resize = binary_mask_uint8(
-                    cv2.resize(mask_crop, (self.model_input_width, self.model_input_height),
-                               interpolation=cv2.INTER_NEAREST))
+                y1, y2, x1, x2 = inpaint_area[k]
+                image_crop = image[y1:y2, x1:x2, :]
+                mask_crop = model_masks[j][y1:y2, x1:x2]
+                image_resize, mask_resize, metadata = self._letterbox(image_crop, mask_crop)
+                if j == 0:
+                    letterbox_metadata[k] = metadata
                 frames_scaled[k].append(image_resize)  # 将缩放后的帧添加到对应列表
                 masks_scaled[k].append(mask_resize)  # 将缩放后的遮罩添加到对应列表
 
@@ -87,10 +149,11 @@ class STTNDetInpaint:
                 # 对于模式中的每一个段落
                 for k in range(len(inpaint_area)):
                     y1, y2, x1, x2 = inpaint_area[k]
-                    comp = cv2.resize(comps[k][j], (x2 - x1, y2 - y1))
+                    comp = self._unletterbox(
+                        comps[k][j], letterbox_metadata[k], (x2 - x1, y2 - y1))
                     frame[y1:y2, x1:x2, :] = alpha_blend(
                         frame[y1:y2, x1:x2, :], comp,
-                        mask[y1:y2, x1:x2])
+                        feather_mask(blend_masks[j][y1:y2, x1:x2]))
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
                 # print(f'processing frame, {len(frames_hr) - j} left')

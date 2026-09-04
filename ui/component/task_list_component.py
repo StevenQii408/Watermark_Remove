@@ -25,6 +25,7 @@ class TaskStatus(Enum):
 class TaskOptions(Enum):
     AB_SECTIONS = "ab_sections"
     SUB_AREAS = "sub_areas"
+    PROCESSING_PROFILE = "processing_profile"
 
 @dataclass
 class Task:
@@ -131,7 +132,7 @@ class TaskListComponent(QWidget):
             name=file_name,
             progress=0,
             status=TaskStatus.PENDING,
-            options={},
+            options={TaskOptions.PROCESSING_PROFILE.value: config.processingProfile.value},
         )
         self.tasks.append(task)
         
@@ -140,7 +141,7 @@ class TaskListComponent(QWidget):
         self.table.setRowCount(len(self.tasks))
         
         item0 = QTableWidgetItem(file_name)
-        profile_text = tr['ModelProfile']['Enhanced'] if config.processingProfile.value == 'enhanced' else tr['ModelProfile']['Basic']
+        profile_text = self.profile_text(config.processingProfile.value)
         item1 = QTableWidgetItem(profile_text)
         item2 = QTableWidgetItem("0%")
         item3 = QTableWidgetItem(TaskStatus.PENDING.value)
@@ -184,12 +185,23 @@ class TaskListComponent(QWidget):
                 self.table.scrollTo(self.table.model().index(index, 0))
 
     def refresh_profile(self):
-        """Refresh the displayed model label after the global profile changes."""
-        profile_text = tr['ModelProfile']['Enhanced'] if config.processingProfile.value == 'enhanced' else tr['ModelProfile']['Basic']
+        """Apply the selected profile to pending tasks and refresh labels."""
+        profile = config.processingProfile.value
         for index in range(len(self.tasks)):
+            if self.tasks[index].status == TaskStatus.PENDING:
+                self.tasks[index].options[TaskOptions.PROCESSING_PROFILE.value] = profile
             item = self.table.item(index, 1)
             if item:
-                item.setText(profile_text)
+                item.setText(self.profile_text(self.tasks[index].options.get(
+                    TaskOptions.PROCESSING_PROFILE.value, profile)))
+
+    @staticmethod
+    def profile_text(profile):
+        return tr['ModelProfile'].get({
+            'basic': 'Basic',
+            'enhanced': 'Enhanced',
+            'sttn_fast': 'SttnFast',
+        }.get(profile, 'Basic'), tr['ModelProfile']['Basic'])
                 
     def update_task_status(self, index, status):
         """更新任务状态
