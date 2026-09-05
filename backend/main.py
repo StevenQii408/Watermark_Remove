@@ -174,12 +174,7 @@ class SubtitleRemover:
         self._preview_counter += 1
         if not force and self._preview_counter % self._preview_interval:
             return
-        preview_frame = ensure_bgr_uint8(frame_ori)
-        if mask is not None:
-            preview_mask = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
-            preview_frame = np.clip(
-                preview_frame.astype(np.float32) + preview_mask * 80.0,
-                0, 255).astype(np.uint8)
+        preview_frame = ensure_bgr_uint8(frame_ori).copy()
         self.update_preview_with_comp(preview_frame, ensure_bgr_uint8(frame_comp))
 
     @staticmethod
@@ -245,6 +240,13 @@ class SubtitleRemover:
                     return True
             previous_boxes = boxes
         return False
+
+    def basic_sttn_batch_limit(self):
+        limit = config.getSttnMaxLoadNum()
+        free_vram = HardwareAccelerator.instance().get_available_vram_mb()
+        if free_vram > 0:
+            limit = min(limit, max(1, int(max(512.0, free_vram - 1024.0) / 96.0)))
+        return max(1, limit), free_vram
 
     def write_original_video(self, tbar):
         """Pass through the source frames when no text was detected."""
@@ -561,19 +563,46 @@ class SubtitleRemover:
                         continue
                 # self.append_output(f'inpaint with mask: {mask_area_coordinates}')
                 batch_offset = 0
-                for batch in batch_generator(frames_need_inpaint, config.getSttnMaxLoadNum()):
+                batch_limit, free_vram = (self.basic_sttn_batch_limit()
+                                          if isinstance(model, STTNDetInpaint)
+                                          else (config.getSttnMaxLoadNum(), 0))
+                if isinstance(model, STTNDetInpaint):
+                    self.append_output(f'基础版：安全批次 {batch_limit}，可用显存 {free_vram:.0f} MB')
+                pending_batches = list(batch_generator(frames_need_inpaint, batch_limit))
+                while pending_batches:
+                    batch = pending_batches.pop(0)
                     # 2. 调用批推理
                     if len(batch) >= 1:
                         batch_blend_masks = frame_blend_masks[batch_offset:batch_offset + len(batch)]
                         batch_model_masks = frame_model_masks[batch_offset:batch_offset + len(batch)]
-                        if isinstance(model, STTNDetInpaint):
-                            inpainted_frames = model(
-                                batch, batch_model_masks, blend_masks=batch_blend_masks)
-                            if model.last_wide_slice_count:
+                        try:
+                            if isinstance(model, STTNDetInpaint):
+                                inpainted_frames = model(
+                                    batch, batch_model_masks, blend_masks=batch_blend_masks)
+                                if len(inpainted_frames) != len(batch):
+                                    self.append_output(
+                                        f'基础版：模型输出帧数异常（输入 {len(batch)}，输出 '
+                                        f'{len(inpainted_frames)}），当前批次保留原帧')
+                                    inpainted_frames = batch
+                                if model.last_wide_slice_count:
+                                    self.append_output(
+                                        f'基础版：宽字幕增加 {model.last_wide_slice_count} 个局部切片')
+                            else:
+                                inpainted_frames = model(batch, model_mask)
+                        except RuntimeError as error:
+                            if not isinstance(model, STTNDetInpaint) or 'out of memory' not in str(error).lower():
+                                raise
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            if len(batch) > 1:
+                                middle = max(1, len(batch) // 2)
+                                pending_batches[0:0] = [batch[:middle], batch[middle:]]
                                 self.append_output(
-                                    f'基础版：宽字幕增加 {model.last_wide_slice_count} 个局部切片')
-                        else:
-                            inpainted_frames = model(batch, model_mask)
+                                    f'基础版：STTN 显存不足，批次 {len(batch)} 二分为 {len(batch[:middle])}+{len(batch[middle:])}')
+                                continue
+                            self.append_output('基础版：单帧仍显存不足，保留原帧')
+                            inpainted_frames = [batch[0]]
+                            self.log_inpaint_fallback(model)
                         self.log_inpaint_fallback(model)
                         for i, inpainted_frame in enumerate(inpainted_frames):
                             self.video_writer.write(inpainted_frame)
@@ -583,6 +612,9 @@ class SubtitleRemover:
                             self.emit_preview(batch[i], inpainted_frame, preview_mask,
                                               force=i == len(batch) - 1)
                         batch_offset += len(batch)
+                        if isinstance(model, STTNDetInpaint) and torch.cuda.is_available():
+                            # 基础版按批次释放缓存，避免长视频逐批累积保留块。
+                            torch.cuda.empty_cache()
                     self.update_progress(tbar, increment=len(batch))
         reader.stop()
 

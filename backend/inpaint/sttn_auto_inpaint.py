@@ -15,7 +15,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from backend.config import config
 from backend.inpaint.sttn.auto_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask, is_frame_number_in_ab_sections
+from backend.tools.inpaint_tools import (ensure_bgr_uint8, feather_mask,
+                                          is_frame_number_in_ab_sections,
+                                          normalize_mask)
 from backend.tools.video_io import FramePrefetcher
 from backend.tools.hardware_accelerator import HardwareAccelerator
 
@@ -40,24 +42,46 @@ class STTNInpaint:
         self.neighbor_stride = config.sttnNeighborStride.value
         self.ref_length = config.sttnReferenceLength.value
 
+    def _letterbox(self, image):
+        target_w, target_h = self.model_input_width, self.model_input_height
+        src_h, src_w = image.shape[:2]
+        scale = min(target_w / max(1, src_w), target_h / max(1, src_h))
+        resized_w = max(1, min(target_w, int(round(src_w * scale))))
+        resized_h = max(1, min(target_h, int(round(src_h * scale))))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        resized = cv2.resize(image, (resized_w, resized_h), interpolation=interpolation)
+        left = (target_w - resized_w) // 2
+        top = (target_h - resized_h) // 2
+        right = target_w - resized_w - left
+        bottom = target_h - resized_h - top
+        border = cv2.BORDER_REFLECT_101 if min(src_h, src_w) > 1 else cv2.BORDER_REPLICATE
+        image_padded = cv2.copyMakeBorder(resized, top, bottom, left, right, border)
+        return image_padded, (left, top, resized_w, resized_h)
+
+    @staticmethod
+    def _unletterbox(image, metadata, output_size):
+        left, top, resized_w, resized_h = metadata
+        valid = image[top:top + resized_h, left:left + resized_w]
+        return cv2.resize(valid, output_size, interpolation=cv2.INTER_CUBIC)
+
     def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
         """
         :param input_frames: 原视频帧
         :param mask: 字幕区域mask
         """
-        _, mask = cv2.threshold(input_mask, 127, 1, cv2.THRESH_BINARY)
-        mask = mask[:, :, None]
+        mask = (normalize_mask(input_mask) > 0.5).astype(np.uint8)[:, :, None]
         H_ori, W_ori = mask.shape[:2]
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
         # 确定去字幕的垂直高度部分
-        split_h = int(W_ori * 3 / 16)
-        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask)
+        split_h = max(32, int(W_ori * 3 / 16))
+        inpaint_area = self.build_full_selection_areas(mask, W_ori, H_ori, split_h)
         # 初始化帧存储变量
         # 高分辨率帧存储列表（浅拷贝 + 逐帧 copy，避免 deepcopy 开销）
         frames_hr = [f.copy() for f in input_frames]
         frames_scaled = {}  # 存放缩放后帧的字典
         comps = {}  # 存放补全后帧的字典
+        self._area_metadata = {}
         # 存储最终的视频帧
         inpainted_frames = []
         for k in range(len(inpaint_area)):
@@ -68,8 +92,11 @@ class STTNInpaint:
             image = frames_hr[j]
             # 对每个去除部分进行切割和缩放
             for k in range(len(inpaint_area)):
-                image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]  # 切割
-                image_resize = cv2.resize(image_crop, (self.model_input_width, self.model_input_height))  # 缩放
+                y1, y2, x1, x2 = inpaint_area[k]
+                image_crop = image[y1:y2, x1:x2, :]
+                image_resize, metadata = self._letterbox(image_crop)
+                if j == 0:
+                    self._area_metadata[k] = metadata
                 frames_scaled[k].append(image_resize)  # 将缩放后的帧添加到对应列表
 
         # 处理每一个去除部分
@@ -83,18 +110,45 @@ class STTNInpaint:
                 frame = frames_hr[j]  # 取出原始帧
                 # 对于模式中的每一个段落
                 for k in range(len(inpaint_area)):
-                    comp = cv2.resize(comps[k][j], (W_ori, split_h))  # 将补全帧缩放回原大小
-                    comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)  # 转换颜色空间
-                    # 获取遮罩区域并进行图像合成
-                    mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]  # 取出遮罩区域
-                    # 实现遮罩区域内的图像融合
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = mask_area * comp + (1 - mask_area) * frame[inpaint_area[k][0]:inpaint_area[k][1], :, :]
+                    y1, y2, x1, x2 = inpaint_area[k]
+                    crop = frame[y1:y2, x1:x2]
+                    comp = self._unletterbox(
+                        comps[k][j], self._area_metadata[k], (x2 - x1, y2 - y1))
+                    comp = cv2.cvtColor(ensure_bgr_uint8(comp), cv2.COLOR_RGB2BGR)
+                    alpha = feather_mask(mask[y1:y2, x1:x2, 0])[:, :, None]
+                    frame[y1:y2, x1:x2] = np.clip(
+                        comp.astype(np.float32) * alpha +
+                        crop.astype(np.float32) * (1.0 - alpha),
+                        0, 255).astype(np.uint8)
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
                 # print(f'processing frame, {len(frames_hr) - j} left')
         else:
             inpainted_frames = frames_hr
         return inpainted_frames
+
+    @staticmethod
+    def build_full_selection_areas(mask, width, height, max_height):
+        binary = (normalize_mask(mask, (height, width)) > 0.5).astype(np.uint8)
+        if not np.any(binary):
+            return []
+        ys = np.where(binary > 0)[0]
+        selected_top, selected_bottom = int(ys.min()), int(ys.max()) + 1
+        context = max(4, min(20, int(max_height * 0.08)))
+        top = max(0, selected_top - context)
+        bottom = min(height, selected_bottom + context)
+        if bottom - top <= max_height:
+            return [(top, bottom, 0, width)]
+        overlap = max(16, min(20, max_height // 6))
+        areas = []
+        start = top
+        while start < bottom:
+            end = min(bottom, start + max_height)
+            areas.append((start, end, 0, width))
+            if end >= bottom:
+                break
+            start = max(start + 1, end - overlap)
+        return areas
 
     @staticmethod
     def read_mask(path):
@@ -124,6 +178,9 @@ class STTNInpaint:
         使用STTN完成空洞填充（空洞即被遮罩的区域）
         """
         frame_length = len(frames)
+        if frame_length == 0:
+            return []
+        frames = [ensure_bgr_uint8(frame) for frame in frames]
         # 对帧进行预处理转换为张量，并进行归一化
         feats = _to_tensors(frames).unsqueeze(0) * 2 - 1
         # 把特征张量转移到指定的设备（CPU或GPU）
@@ -196,6 +253,15 @@ class STTNAutoInpaint:
         else:
             self.clip_gap = clip_gap
 
+    @staticmethod
+    def _scene_cut_index(frames, threshold=32.0):
+        for index in range(1, len(frames)):
+            first = cv2.cvtColor(frames[index - 1], cv2.COLOR_BGR2GRAY)
+            second = cv2.cvtColor(frames[index], cv2.COLOR_BGR2GRAY)
+            if float(np.mean(cv2.absdiff(first, second))) >= threshold:
+                return index
+        return None
+
     def __call__(self, input_mask=None, input_sub_remover=None, tbar=None):
         reader = None
         writer = None
@@ -213,116 +279,129 @@ class STTNAutoInpaint:
                 # 创建视频写入对象，用于输出修复后的视频
                 writer = cv2.VideoWriter(self.video_out_path, cv2.VideoWriter_fourcc(*"mp4v"), frame_info['fps'], (frame_info['W_ori'], frame_info['H_ori']))
             
-            # 计算分割高度，用于确定修复区域的大小
-            split_h = int(frame_info['W_ori'] * 3 / 16)
+            split_h = max(32, int(frame_info['W_ori'] * 3 / 16))
 
             if input_mask is None:
                 # 读取掩码
                 mask = self.sttn_inpaint.read_mask(self.mask_path)
             else:
-                _, mask = cv2.threshold(input_mask, 127, 1, cv2.THRESH_BINARY)
-                mask = mask[:, :, None]
+                mask = (normalize_mask(input_mask) > 0.5).astype(np.uint8)[:, :, None]
 
-            # 得到修复区域位置
-            inpaint_area = get_inpaint_area_by_mask(frame_info['W_ori'], frame_info['H_ori'], split_h, mask)
+            inpaint_area = STTNInpaint.build_full_selection_areas(
+                mask, frame_info['W_ori'], frame_info['H_ori'], split_h)
+            if not inpaint_area:
+                tqdm.write('STTN fast erase: empty mask, copying original frames')
+                while True:
+                    success, image = prefetcher.read()
+                    if not success:
+                        break
+                    writer.write(ensure_bgr_uint8(image))
+                    if input_sub_remover is not None:
+                        input_sub_remover.update_progress(tbar, increment=1)
+                return
             # 根据可用显存动态调整 clip_gap，避免 OOM
             effective_clip_gap = self.clip_gap
             vram_mb = HardwareAccelerator.instance().get_available_vram_mb()
             if vram_mb > 0:
-                # 估算每帧约需 (W * H * 3 * 4) bytes，clip_gap帧约需 clip_gap * W * H * 12 bytes（含中间张量）
-                bytes_per_frame = frame_info['W_ori'] * frame_info['H_ori'] * 12
-                max_frames_by_vram = int(vram_mb * 1024 * 1024 / bytes_per_frame)
-                max_frames_by_vram = max(max_frames_by_vram, 10)  # 至少10帧
+                max_frames_by_vram = int(max(512.0, vram_mb - 1536.0) / 128.0)
+                max_frames_by_vram = max(max_frames_by_vram, 4)
                 effective_clip_gap = min(self.clip_gap, max_frames_by_vram)
                 if effective_clip_gap < self.clip_gap:
                     tqdm.write(f'GPU VRAM: {vram_mb:.0f}MB, adjusting clip_gap: {self.clip_gap} -> {effective_clip_gap}')
-            # 计算需要迭代修复视频的次数
-            rec_time = frame_info['len'] // effective_clip_gap if frame_info['len'] % effective_clip_gap == 0 else frame_info['len'] // effective_clip_gap + 1
-            # 遍历每一次的迭代次数
-            for i in range(rec_time):
-                start_f = i * effective_clip_gap  # 起始帧位置
-                end_f = min((i + 1) * effective_clip_gap, frame_info['len'])  # 结束帧位置
-                tqdm.write(f"Processing: {start_f + 1} - {end_f} / Total: {frame_info['len']}")
-                
-                frames_hr = []  # 高分辨率帧列表
-                frames = {}  # 帧字典，用于存储裁剪后的图像
-                comps = {}  # 组合字典，用于存储修复后的图像
-                
-                # 初始化帧字典
-                for k in range(len(inpaint_area)):
-                    frames[k] = []
-                    
-                # 读取和修复高分辨率帧
-                valid_frames_count = 0
-                for j in range(start_f, end_f):
+            context_size = min(config.sttnReferenceLength.value, max(1, effective_clip_gap // 4))
+            pending = []
+            history = []
+            next_frame_index = 0
+            while pending or next_frame_index < frame_info['len']:
+                core = []
+                while len(core) < effective_clip_gap:
+                    if pending:
+                        core.append(pending.pop(0))
+                        continue
+                    if next_frame_index >= frame_info['len']:
+                        break
                     success, image = prefetcher.read()
                     if not success:
-                        print(f"Warning: Failed to read frame {j}.")
+                        next_frame_index = frame_info['len']
                         break
-                    
-                    frames_hr.append(image)
-                    valid_frames_count += 1
-                    
-                    if is_frame_number_in_ab_sections(j, ab_sections):
-                        for k in range(len(inpaint_area)):
-                            # 裁剪、缩放并添加到帧字典
-                            image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                            image_resize = cv2.resize(image_crop, (self.sttn_inpaint.model_input_width, self.sttn_inpaint.model_input_height))
-                            frames[k].append(image_resize)
-                
-                # 如果没有读取到有效帧，则跳过当前迭代
-                if valid_frames_count == 0:
-                    print(f"Warning: No valid frames found in range {start_f+1}-{end_f}. Skipping this segment.")
+                    core.append((next_frame_index, ensure_bgr_uint8(image)))
+                    next_frame_index += 1
+                if not core:
+                    break
+                while len(pending) < context_size and next_frame_index < frame_info['len']:
+                    success, image = prefetcher.read()
+                    if not success:
+                        next_frame_index = frame_info['len']
+                        break
+                    pending.append((next_frame_index, ensure_bgr_uint8(image)))
+                    next_frame_index += 1
+                prefix = list(history[-context_size:])
+                lookahead = list(pending[:context_size])
+                inference_records = prefix + core + lookahead
+                cut_index = self._scene_cut_index([item[1] for item in inference_records])
+                core_prefix_len = len(prefix)
+                if cut_index is not None and cut_index < core_prefix_len:
+                    history = []
+                    prefix = []
+                    inference_records = core + list(pending[:context_size])
+                elif cut_index is not None and cut_index < core_prefix_len + len(core):
+                    split_at = max(0, cut_index - core_prefix_len)
+                    if split_at < len(core):
+                        pending[0:0] = core[split_at:]
+                        core = core[:split_at]
+                        history = []
+                        prefix = []
+                        inference_records = core + list(pending[:context_size])
+                elif cut_index is not None and cut_index >= core_prefix_len + len(core):
+                    lookahead = list(pending[:max(0, cut_index - core_prefix_len - len(core))])
+                    inference_records = prefix + core + lookahead
+                    history = []
+                if not core:
                     continue
-                    
-                # 对每个修复区域运行修复
-                for k in range(len(inpaint_area)):
-                    if len(frames[k]) > 0:  # 确保有帧可以处理
-                        comps[k] = self.sttn_inpaint.inpaint(frames[k])
-                    else:
-                        comps[k] = []
-                
-                # 如果有要修复的区域
-                if inpaint_area and valid_frames_count > 0:
-                    # 创建一个映射，记录哪些帧被处理了以及它们在frames[k]中的索引
-                    processed_frames_map = {}
-                    processed_idx = 0
-                    
-                    # 构建映射关系
-                    for j in range(start_f, end_f):
-                        if j - start_f < valid_frames_count and is_frame_number_in_ab_sections(j, ab_sections):
-                            processed_frames_map[j - start_f] = processed_idx
-                            processed_idx += 1
-                    
-                    # 应用修复结果
-                    for j in range(valid_frames_count):
-                        if input_sub_remover is not None and input_sub_remover.gui_mode:
-                            original_frame = frames_hr[j].copy()
-                        else:
-                            original_frame = None
-                            
-                        frame = frames_hr[j]
-                        
-                        # 只有被处理过的帧才应用修复结果
-                        if j in processed_frames_map:
-                            comp_idx = processed_frames_map[j]
-                            for k in range(len(inpaint_area)):
-                                if comp_idx < len(comps[k]):  # 确保索引有效
-                                    # 将修复的图像重新扩展到原始分辨率，并融合到原始帧
-                                    comp = cv2.resize(comps[k][comp_idx], (frame_info['W_ori'], split_h))
-                                    comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)
-                                    mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]
-                                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = mask_area * comp + (1 - mask_area) * frame[inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                        
-                        writer.write(frame)
-                        
-                        if input_sub_remover is not None:
-                            if tbar is not None:
-                                input_sub_remover.update_progress(tbar, increment=1)
-                            if original_frame is not None and input_sub_remover.gui_mode:
-                                input_sub_remover.emit_preview(original_frame, frame)
-                # 每个chunk处理完后清理GPU缓存
-                del frames_hr, frames, comps
+                tqdm.write(
+                    f"Processing: {core[0][0] + 1} - {core[-1][0] + 1} / "
+                    f"Total: {frame_info['len']} (context {len(prefix)}+{len(lookahead)})")
+                frames_by_area = {k: [] for k in range(len(inpaint_area))}
+                area_metadata = {}
+                for _, image in inference_records:
+                    for k, (y1, y2, x1, x2) in enumerate(inpaint_area):
+                        crop = image[y1:y2, x1:x2]
+                        resized, metadata = self.sttn_inpaint._letterbox(crop)
+                        frames_by_area[k].append(resized)
+                        area_metadata[k] = metadata
+                try:
+                    comps = {k: self.sttn_inpaint.inpaint(value)
+                             for k, value in frames_by_area.items()}
+                except Exception as error:
+                    tqdm.write(f'STTN fast erase: block failed, fallback to original frames: {error}')
+                    comps = {}
+                output_lengths = [len(value) for value in comps.values()]
+                if output_lengths and any(length != len(inference_records) for length in output_lengths):
+                    tqdm.write('STTN fast erase: output count mismatch, fallback to original core frames')
+                    comps = {}
+                core_ids = {item[0]: index for index, item in enumerate(inference_records)}
+                for frame_index, original in core:
+                    frame = original.copy()
+                    if comps and is_frame_number_in_ab_sections(frame_index, ab_sections):
+                        output_index = core_ids.get(frame_index)
+                        for k, (y1, y2, x1, x2) in enumerate(inpaint_area):
+                            if output_index is None or output_index >= len(comps.get(k, [])):
+                                continue
+                            comp = self.sttn_inpaint._unletterbox(
+                                comps[k][output_index], area_metadata[k], (x2 - x1, y2 - y1))
+                            comp = cv2.cvtColor(ensure_bgr_uint8(comp), cv2.COLOR_RGB2BGR)
+                            alpha = feather_mask(normalize_mask(mask[y1:y2, x1:x2]))[:, :, None]
+                            crop = frame[y1:y2, x1:x2].astype(np.float32)
+                            frame[y1:y2, x1:x2] = np.clip(
+                                comp.astype(np.float32) * alpha + crop * (1.0 - alpha),
+                                0, 255).astype(np.uint8)
+                    writer.write(frame)
+                    if input_sub_remover is not None:
+                        if tbar is not None:
+                            input_sub_remover.update_progress(tbar, increment=1)
+                        input_sub_remover.emit_preview(original, frame)
+                history = core[-context_size:]
+                del frames_by_area, comps, inference_records
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
