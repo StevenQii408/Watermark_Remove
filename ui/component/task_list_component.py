@@ -199,7 +199,6 @@ class TaskListComponent(QWidget):
     def profile_text(profile):
         return tr['ModelProfile'].get({
             'basic': 'Basic',
-            'enhanced': 'Enhanced',
             'sttn_fast': 'SttnFast',
         }.get(profile, 'Basic'), tr['ModelProfile']['Basic'])
                 

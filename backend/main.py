@@ -20,7 +20,6 @@ from backend.inpaint.sttn_det_inpaint import STTNDetInpaint
 from backend.inpaint.lama_inpaint import LamaInpaint
 from backend.inpaint.opencv_inpaint import OpenCVInpaint
 from backend.inpaint.pure_background_inpaint import PureBackgroundInpaint
-from backend.inpaint.propainter_inpaint import PropainterInpaint
 from backend.tools.inpaint_tools import (create_mask, batch_generator, ensure_bgr_uint8,
                                           create_subtitle_masks, expand_frame_ranges,
                                           expand_solid_background_mask, mask_edge_density)
@@ -70,7 +69,6 @@ class SubtitleRemover:
         except Exception:
             self.video_writer = cv2.VideoWriter(get_readable_path(self.video_temp_file.name), cv2.VideoWriter_fourcc(*'mp4v'), self.fps, self.size)
         self.video_out_path = os.path.abspath(os.path.join(os.path.dirname(self.video_path), f'{self.vd_name}_no_sub.mp4'))
-        self.propainter_inpaint = None
         self.ext = os.path.splitext(vd_path)[-1]
         if self.is_picture:
             pic_dir = os.path.join(os.path.dirname(self.video_path), 'no_sub')
@@ -222,6 +220,41 @@ class SubtitleRemover:
             return False
         return mask_edge_density(frames[0], mask) >= 0.08
 
+    def large_title_metrics(self, sub_list, start_frame, end_frame):
+        """Return normalized height, span and area metrics for a clip."""
+        max_height_ratio = 0.0
+        max_area_ratio = 0.0
+        max_span_ratio = 0.0
+        for frame_no in range(start_frame, end_frame + 1):
+            boxes = sub_list.get(frame_no, [])
+            rectangles = []
+            for box in boxes:
+                if len(box) != 4:
+                    continue
+                xmin, xmax, ymin, ymax = [int(value) for value in box]
+                if xmax <= xmin or ymax <= ymin:
+                    continue
+                rectangles.append((xmin, xmax, ymin, ymax))
+                max_height_ratio = max(max_height_ratio, (ymax - ymin) / max(1, self.frame_height))
+            if not rectangles:
+                continue
+            left = max(0, min(item[0] for item in rectangles))
+            right = min(self.frame_width, max(item[1] for item in rectangles))
+            top = max(0, min(item[2] for item in rectangles))
+            bottom = min(self.frame_height, max(item[3] for item in rectangles))
+            max_span_ratio = max(max_span_ratio, (bottom - top) / max(1, self.frame_height))
+            max_area_ratio = max(max_area_ratio,
+                                 (right - left) * (bottom - top) /
+                                 max(1, self.frame_width * self.frame_height))
+        return max_height_ratio, max_span_ratio, max_area_ratio
+
+    def is_large_title_clip(self, sub_list, start_frame, end_frame):
+        """Detect large title-like text using resolution-independent thresholds."""
+        height_ratio, span_ratio, area_ratio = self.large_title_metrics(
+            sub_list, start_frame, end_frame)
+        return (height_ratio >= 0.04 or span_ratio >= 0.07 or
+                area_ratio >= 0.08)
+
     @staticmethod
     def has_moving_subtitles(sub_list):
         """Return whether adjacent detected subtitle frames show meaningful motion."""
@@ -257,131 +290,6 @@ class SubtitleRemover:
                 break
             self.video_writer.write(frame)
             self.update_progress(tbar, increment=1)
-
-    def propainter_mode(self, tbar):
-        sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
-        sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
-        if len(sub_list) == 0:
-            self.append_output(tr['Main']['NoTextInAreaHint'])
-            self.write_original_video(tbar)
-            return
-        self.append_output(tr['Main']['DetectedSubtitleBoxes'].format(
-            sum(len(boxes) for boxes in sub_list.values())))
-        continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
-        scene_div_points = sub_detector.get_scene_div_frame_no(self.video_path)
-        continuous_frame_no_list = sub_detector.split_range_by_scene(continuous_frame_no_list,
-                                                                          scene_div_points)
-        del sub_detector
-        gc.collect()        
-        device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() else torch.device("cpu")
-        propainter_inpaint = PropainterInpaint(device, self.model_config.PROPAINTER_MODEL_DIR, config.propainterMaxLoadNum.value)
-        self.append_output(tr['Main']['ProcessingStartRemovingSubtitles'])
-        index = 0
-        # 使用帧预读取，I/O 与推理重叠
-        reader = FramePrefetcher(self.video_cap)
-        while True:
-            ret, frame = reader.read()
-            if not ret:
-                break
-            index += 1
-            # 如果当前帧没有水印/文本则直接写
-            if index not in sub_list.keys():
-                self.video_writer.write(frame)
-                # self.append_output(f'write frame: {index}')
-                self.update_progress(tbar, increment=1)
-                self.emit_preview(frame, frame)
-                continue
-            # 如果有水印，判断该帧是不是开头帧
-            else:
-                # 如果是开头帧，则批推理到尾帧
-                if self.is_current_frame_no_start(index, continuous_frame_no_list):
-                    # self.append_output(f'No 1 Current index: {index}')
-                    start_frame_no = index
-                    # self.append_output(f'find start: {start_frame_no}')
-                    # 找到结束帧
-                    end_frame_no = self.find_frame_no_end(index, continuous_frame_no_list)
-                    # 判断当前帧号是不是字幕起始位置
-                    # 如果获取的结束帧号不为-1则说明
-                    if end_frame_no != -1:
-                        # self.append_output(f'find end: {end_frame_no}')
-                        # ************ 读取该区间所有帧 start ************
-                        temp_frames = list()
-                        # 将头帧加入处理列表
-                        temp_frames.append(frame)
-                        inner_index = 0
-                        # 一直读取到尾帧
-                        while index < end_frame_no:
-                            ret, frame = reader.read()
-                            if not ret:
-                                break
-                            index += 1
-                            temp_frames.append(frame)
-                        # ************ 读取该区间所有帧 end ************
-                        if len(temp_frames) < 1:
-                            # 没有待处理，直接跳过
-                            continue
-                        elif len(temp_frames) == 1:
-                            inner_index += 1
-                            single_mask, _ = create_subtitle_masks(
-                                self.mask_size, sub_list[start_frame_no])
-                            single_mask = self.enrich_solid_background_mask(temp_frames[0], single_mask)
-                            inpainted_frame = self.lama_inpaint.inpaint(temp_frames[0], single_mask)
-                            self.video_writer.write(inpainted_frame)
-                            self.emit_preview(temp_frames[0], inpainted_frame, single_mask, force=True)
-                            # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
-                            self.update_progress(tbar, increment=1)
-                            continue
-                        else:
-                            # 将读取的视频帧分批处理
-                            # 1. 获取当前批次使用的mask
-                            mask = create_mask(self.mask_size, sub_list[start_frame_no])
-                            mask = self.enrich_solid_background_mask(temp_frames[0], mask)
-                            self.append_output(tr['Main']['InpaintMaskStats'].format(
-                                int(np.count_nonzero(mask)), mask.shape[1], mask.shape[0]))
-                            if not np.any(mask):
-                                self.append_output(tr['Main']['NoTextInAreaHint'])
-                                for original_frame in temp_frames:
-                                    self.video_writer.write(original_frame)
-                                self.update_progress(tbar, increment=len(temp_frames))
-                                continue
-                            pure_mode = config.pureBackgroundMode.value
-                            if pure_mode != "off" and config.qualityProfile.value != "speed":
-                                pure_inpaint = PureBackgroundInpaint(
-                                    config.pureBackgroundVarianceThreshold.value,
-                                    config.pureBackgroundTemporalWindow.value)
-                                pure_frames = pure_inpaint(temp_frames, mask)
-                                if pure_frames is not None or pure_mode == "force":
-                                    output_frames = (pure_frames if pure_frames is not None
-                                                     else pure_inpaint.force(temp_frames, mask))
-                                    for output_index, output_frame in enumerate(output_frames):
-                                        self.video_writer.write(output_frame)
-                                        self.emit_preview(
-                                            temp_frames[output_index], output_frame, mask,
-                                            force=output_index == len(output_frames) - 1)
-                                    self.update_progress(tbar, increment=len(output_frames))
-                                    continue
-                            for batch in batch_generator(temp_frames, config.propainterMaxLoadNum.value):
-                                # 2. 调用批推理
-                                if len(batch) == 1:
-                                    single_mask = create_mask(self.mask_size, sub_list[start_frame_no])
-                                    single_mask = self.enrich_solid_background_mask(batch[0], single_mask)
-                                    inpainted_frame = self.lama_inpaint.inpaint(batch[0], single_mask)
-                                    self.video_writer.write(inpainted_frame)
-                                    self.emit_preview(batch[0], inpainted_frame, single_mask,
-                                                      force=True)
-                                    # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
-                                    inner_index += 1
-                                    self.update_progress(tbar, increment=1)
-                                elif len(batch) > 1:
-                                    inpainted_frames = propainter_inpaint(batch, mask)
-                                    self.log_inpaint_fallback(propainter_inpaint)
-                                    for i, inpainted_frame in enumerate(inpainted_frames):
-                                        self.video_writer.write(inpainted_frame)
-                                        # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[index]}')
-                                        inner_index += 1
-                                        self.emit_preview(batch[i], inpainted_frame, mask,
-                                                          force=i == len(batch) - 1)
-                                self.update_progress(tbar, increment=len(batch))
 
     def sttn_auto_mode(self, tbar):
         """
@@ -515,10 +423,46 @@ class SubtitleRemover:
                         self.video_writer.write(original_frame)
                     self.update_progress(tbar, increment=len(frames_need_inpaint))
                     continue
+                lama_failed = False
+                title_metrics = self.large_title_metrics(
+                    sub_list, start_frame_index, end_frame_index)
+                large_title_candidate = (isinstance(model, STTNDetInpaint) and
+                                         (title_metrics[0] >= 0.04 or
+                                          title_metrics[1] >= 0.07 or
+                                          title_metrics[2] >= 0.08))
+                if large_title_candidate:
+                    self.append_output(
+                        '大标题：自动切换 LaMa（文字高度 {:.1%}，区域高度 {:.1%}，面积 {:.1%}）'.format(
+                            *title_metrics))
+                    try:
+                        lama_outputs = []
+                        for output_index, original_frame in enumerate(frames_need_inpaint):
+                            raw_output = self.lama_inpaint.inpaint_local(
+                                original_frame, frame_blend_masks[output_index])
+                            if not np.isfinite(np.asarray(raw_output)).all():
+                                raise ValueError('LaMa output contains non-finite values')
+                            output_frame = ensure_bgr_uint8(raw_output)
+                            if output_frame.shape[:2] != original_frame.shape[:2]:
+                                raise ValueError('LaMa output size mismatch')
+                            lama_outputs.append(output_frame)
+                    except Exception as error:
+                        lama_failed = True
+                        self.append_output(f'大标题 LaMa 失败，回退 STTN：{error}')
+                    else:
+                        self.append_output('大标题 LaMa 修复完成')
+                        for output_index, output_frame in enumerate(lama_outputs):
+                            self.video_writer.write(output_frame)
+                            self.emit_preview(
+                                frames_need_inpaint[output_index], output_frame,
+                                frame_blend_masks[output_index],
+                                force=output_index == len(lama_outputs) - 1)
+                        self.update_progress(tbar, increment=len(lama_outputs))
+                        continue
                 # Flat-background path: deterministic color/gradient reconstruction is
                 # faster and more stable than generative inpainting for these clips.
                 pure_mode = config.pureBackgroundMode.value
-                if pure_mode != "off" and config.qualityProfile.value != "speed":
+                if (not lama_failed and pure_mode != "off" and
+                        config.qualityProfile.value != "speed"):
                     pure_inpaint = PureBackgroundInpaint(
                         config.pureBackgroundVarianceThreshold.value,
                         config.pureBackgroundTemporalWindow.value)
@@ -659,9 +603,7 @@ class SubtitleRemover:
         else:
             # 精准模式下，获取场景分割的帧号，进一步切割
             self.log_model()
-            if config.inpaintMode.value == InpaintMode.PROPAINTER:
-                self.propainter_mode(tbar)
-            elif config.inpaintMode.value == InpaintMode.STTN_AUTO:
+            if config.inpaintMode.value == InpaintMode.STTN_AUTO:
                 self.sttn_auto_mode(tbar)
             elif config.inpaintMode.value == InpaintMode.STTN_DET:
                 self.video_inpaint(tbar, self.sttn_det_inpaint)
@@ -690,7 +632,6 @@ class SubtitleRemover:
     def log_model(self):
         model_key = {
             InpaintMode.STTN_DET: 'Basic',
-            InpaintMode.PROPAINTER: 'Enhanced',
             InpaintMode.STTN_AUTO: 'SttnFast',
         }.get(config.inpaintMode.value, 'Basic')
         model_friendly_name = tr['ModelProfile'].get(model_key, tr['ModelProfile']['Basic'])

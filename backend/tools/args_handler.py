@@ -5,7 +5,7 @@ from .constant import InpaintMode
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Video Subtitle Remover Command Line Tool"
+        description="Video Watermark Eraser Command Line Tool"
     )
     parser.add_argument(
         "--input", "-i", required=True, type=str,

@@ -457,19 +457,3 @@ def read_frames(v_path):
     video_frames = [Image.fromarray(f) for f in video_frames]
     return video_frames
 
-
-if __name__ == '__main__':
-    # PropainterInpaint
-    propainter_inpaint = PropainterInpaint(get_device(), ModelConfig().PROPAINTER_MODEL_DIR, sub_video_length=80)
-    frames = read_frames('/home/yao/Documents/Project/video-subtitle-remover/local_test/test1.mp4')
-    mask = cv2.imread('/home/yao/Documents/Project/video-subtitle-remover/local_test/test1_mask.png')
-    inpainted_frames = propainter_inpaint.inpaint(frames, mask)
-    save_root = '/home/yao/Documents/Project/video-subtitle-remover/local_test/'
-    video_out_path = os.path.join(save_root, 'inpaint_out.mp4')
-    print("size: ", inpainted_frames[0].shape)
-    video_writer = cv2.VideoWriter(video_out_path, cv2.VideoWriter_fourcc(*'mp4v'), 24, (640, 360))
-    for comp_frame in inpainted_frames:
-        video_writer.write(comp_frame)
-    video_writer.release()
-    print(f'\nAll results are saved in {save_root}')
-

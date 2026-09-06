@@ -7,8 +7,8 @@ from PIL import Image
 from backend.inpaint.utils.lama_util import prepare_img_and_mask, get_image, pad_img_to_modulo
 from backend import config
 from backend.tools.inpaint_tools import (alpha_blend, binary_mask_uint8,
-                                          feather_mask, get_inpaint_area_by_mask,
-                                          normalize_mask)
+                                          ensure_bgr_uint8, feather_mask,
+                                          get_inpaint_area_by_mask, normalize_mask)
 
 class LamaInpaint:
     def __init__(self, device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), model_path='big-lama.pt') -> None:
@@ -30,6 +30,29 @@ class LamaInpaint:
             cur_res = np.clip(cur_res * 255, 0, 255).astype('uint8')
             cur_res = cur_res[:orig_height, :orig_width]
             return alpha_blend(original_image, cur_res, feather_mask(original_mask))
+
+    def inpaint_local(self, image: np.ndarray, mask: np.ndarray, padding=16):
+        """Repair only the bounding box around a mask and paste it back safely."""
+        original = ensure_bgr_uint8(image)
+        normalized = normalize_mask(mask, original.shape[:2])
+        ys, xs = np.where(normalized > 0.5)
+        if len(xs) == 0:
+            return original.copy()
+        height, width = original.shape[:2]
+        mask_height = int(ys.max() - ys.min() + 1)
+        context = max(int(padding), min(96, int(round(mask_height * 0.25))))
+        y1 = max(0, int(ys.min()) - context)
+        y2 = min(height, int(ys.max()) + context + 1)
+        x1 = max(0, int(xs.min()) - context)
+        x2 = min(width, int(xs.max()) + context + 1)
+        crop = original[y1:y2, x1:x2]
+        crop_mask = normalized[y1:y2, x1:x2]
+        repaired = self.inpaint(crop, crop_mask)
+        if not np.isfinite(np.asarray(repaired)).all():
+            raise ValueError('LaMa output contains non-finite values')
+        result = original.copy()
+        result[y1:y2, x1:x2] = repaired
+        return result
 
     def _inpaint_batch(self, images: List[np.ndarray], masks: List[np.ndarray]):
         """批量推理：将多帧分小批次送入 GPU，避免单次推理过大导致卡死"""

@@ -433,7 +433,6 @@ class HomeInterface(QWidget):
                                 config.processingProfile.value)
                             mode_map = {
                                 'basic': InpaintMode.STTN_DET,
-                                'enhanced': InpaintMode.PROPAINTER,
                                 'sttn_fast': InpaintMode.STTN_AUTO,
                             }
                             options['inpaint_mode'] = mode_map.get(

@@ -22,7 +22,7 @@ Watermark Remove is an AI-assisted desktop application for processing hard subti
 - One or more user-drawn processing regions
 - Precise OCR detection with small-subtitle enhancement
 - Dedicated restoration path for solid or nearly solid subtitle panels
-- Basic and Enhanced processing profiles
+- Subtitle mode (OCR + STTN, with automatic LaMa for large titles) and STTN Fast Erase
 - CUDA, DirectML, and CPU environment detection with a hardware-acceleration switch
 - Multiple tasks, timeline ranges, live progress, and processing logs
 - Original pixels are preserved outside the active mask to reduce black boxes and color artifacts
@@ -44,7 +44,7 @@ NVIDIA users need a CUDA-enabled PyTorch build compatible with their drivers. CP
 
 1. Add a video or image.
 2. Draw one or more regions around subtitles or text watermarks.
-3. Use **Basic** for standard scenes or **Enhanced** for moving and complex backgrounds.
+3. Use **Subtitle** for OCR-assisted processing or **STTN Fast Erase** when OCR is not needed.
 4. Verify hardware acceleration, then start processing.
 
 Only process media that you own or are authorized to edit.

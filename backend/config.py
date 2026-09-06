@@ -1,5 +1,6 @@
 
 import os
+import json
 from pathlib import Path
 from qfluentwidgets import (qconfig, ConfigItem, QConfig, OptionsValidator, BoolValidator, OptionsConfigItem, 
                             EnumSerializer, RangeValidator, RangeConfigItem, ConfigValidator)
@@ -42,12 +43,11 @@ class Config(QConfig):
     - InpaintMode.STTN_AUTO 智能擦除版
     - InpaintMode.STTN_DET 带字幕检测版, 无智能擦除
     - InpaintMode.LAMA 算法：对于动画类视频效果好，速度一般，不可以跳过字幕检测
-    - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
     """
-    # 【设置inpaint算法】由 processingProfile 映射：basic=STTN_DET，enhanced=PROPAINTER，sttn_fast=STTN_AUTO
+    # 【设置inpaint算法】由 processingProfile 映射：basic=STTN_DET，sttn_fast=STTN_AUTO
     inpaintMode = OptionsConfigItem("Main", "InpaintMode", InpaintMode.STTN_DET, OptionsValidator(InpaintMode), EnumSerializer(InpaintMode))
     processingProfile = OptionsConfigItem("Main", "ProcessingProfile", "basic",
-                                          OptionsValidator(["basic", "enhanced", "sttn_fast"]))
+                                          OptionsValidator(["basic", "sttn_fast"]))
     
     subtitleDetectMode =  OptionsConfigItem("Main", "SubtitleDetectMode", SubtitleDetectMode.PP_OCRv5_SERVER, OptionsValidator(SubtitleDetectMode), EnumSerializer(SubtitleDetectMode))
 
@@ -101,12 +101,6 @@ class Config(QConfig):
     sttnMaxLoadNum = RangeConfigItem("Sttn", "MaxLoadNum", 50, RangeValidator(1, 300))
     getSttnMaxLoadNum = lambda self: max(self.sttnMaxLoadNum.value, self.sttnNeighborStride.value * self.sttnReferenceLength.value)
     
-    # 以下参数仅适用PROPAINTER算法时，才生效
-    # 【根据自己的GPU显存大小设置】最大同时处理的图片数量，设置越大处理效果越好，但是要求显存越高
-    # 1280x720p视频设置80需要25G显存，设置50需要19G显存
-    # 720x480p视频设置80需要8G显存，设置50需要7G显存
-    propainterMaxLoadNum = RangeConfigItem("ProPainter", "MaxLoadNum", 70, RangeValidator(1, 300))
-
     # 是否使用硬件加速
     hardwareAcceleration = ConfigItem("Main", "HardwareAcceleration", HARDWARD_ACCELERATION_OPTION, BoolValidator())
     
@@ -117,6 +111,33 @@ class Config(QConfig):
     saveDirectory = ConfigItem("Main", "SaveDirectory", "", ConfigValidator())
 
 CONFIG_FILE = 'config/config.json'
+
+
+def _migrate_legacy_config_file():
+    """Rewrite removed processing values before enum deserialization."""
+    config_path = Path(CONFIG_FILE)
+    if not config_path.exists():
+        return
+    try:
+        with config_path.open(encoding='utf-8') as config_file:
+            raw_config = json.load(config_file)
+        main_config = raw_config.get('Main', {})
+        changed = False
+        if str(main_config.get('InpaintMode', '')).lower() == 'propainter':
+            main_config['InpaintMode'] = InpaintMode.STTN_DET.value
+            changed = True
+        if str(main_config.get('ProcessingProfile', '')).lower() == 'enhanced':
+            main_config['ProcessingProfile'] = 'basic'
+            changed = True
+        if changed:
+            raw_config['Main'] = main_config
+            with config_path.open('w', encoding='utf-8') as config_file:
+                json.dump(raw_config, config_file, ensure_ascii=False, indent=4)
+    except (OSError, ValueError, TypeError):
+        return
+
+
+_migrate_legacy_config_file()
 config = Config()
 qconfig.load(CONFIG_FILE, config)
 
@@ -130,7 +151,9 @@ elif isinstance(_detect_mode_value, str) and _detect_mode_value in ("精准", "P
 # The desktop UI exposes only the precise detector. Migrate legacy language/model values.
 if config.interface.value not in config.interface.validator.options:
     config.set(config.interface, 'ch')
-if config.processingProfile.value not in config.processingProfile.validator.options:
+if config.processingProfile.value == 'enhanced':
+    config.set(config.processingProfile, 'basic')
+elif config.processingProfile.value not in config.processingProfile.validator.options:
     config.set(config.processingProfile, 'basic')
 config.set(config.subtitleDetectMode, SubtitleDetectMode.PP_OCRv5_SERVER)
 
